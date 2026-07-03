@@ -1,0 +1,48 @@
+{
+  "name": "@cotal-ai/oh-my-pi",
+  "description": "Cotal connector for oh-my-pi: a headless native-embed peer, plus an interactive session extension that joins a live session to the mesh.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "omp": {
+    "extensions": ["./dist/extension.bundle.js"]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json && pnpm run bundle",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/extension.bundle.js --external:@oh-my-pi/*",
+    "smoke:extension": "tsx oh-my-pi-extension.smoke.ts",
+    "smoke:interactive-loop": "tsx interactive-loop.smoke.ts",
+    "prepublishOnly": "pnpm run build"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "^16.2.6",
+    "@cotal-ai/connector-core": "workspace:*",
+    "tsx": "^4.22.4"
+  },
+  "peerDependencies": {
+    "@cotal-ai/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@cotal-ai/core": "workspace:*",
+    "esbuild": "^0.28.0",
+    "zod": "^4.4.3"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
