@@ -103,14 +103,18 @@ data"). That makes the registry a **mode-independent convention carrier**: the s
 assignments here" instruction reaches every agent in auth *and* open mode.
 
 Replay is a **push into every joining agent's context** — and there is **no backward-history
-query** (an agent can only see what replay delivers at join; `recallAmbient` is focus-mode-only,
-"since you entered focus"). So replay size is pure per-spawn context cost with no lazy-pull upside,
-and the tracker is the durable authority regardless. Hence: **`#coordination` replay is OFF** —
-live detail (zone claims, interface handshakes) is only relevant in the moment, and a fresh worker
-shouldn't be force-fed a wall of expired chatter it can't act on. **`#general` replays 24h** so a
-late-spawned worker still sees the current directive/announcement, not a week of them. Anything
-durable lives in the tracker, which the supervisor owns and workers read from disk.
-`replayWindow` / `replay` are supported per-channel registry fields (`examples/01-lateral-coordination/channels.json:6,11`).
+query**. `recallAmbient` is the only other backfill path and it's doubly gated: it returns empty
+unless `attention == focus` (`extensions/connector-core/src/agent.ts:441-443`) *and* it's
+replay-gated per channel — a `replay: false` channel yields nothing, by explicit design ("recall
+must not become a history bypass", `agent.ts:434-436`). So replay-on-join is the sole backfill
+path: replay size is pure per-spawn context cost with no lazy-pull upside, and the tracker is the
+durable authority regardless. Hence: **`#coordination` replay is OFF** — live detail (zone claims,
+interface handshakes) is only relevant in the moment, and a fresh worker shouldn't be force-fed a
+wall of expired chatter it can't act on. **`#general` replays 24h** so a late-spawned worker still
+sees the current directive/announcement, not a week of them (`"24h"` parses via the registry's
+`parseDuration`, `^(\d+)(s|m|h|d)$` — `packages/core/src/channels.ts:59-60`). Anything durable
+lives in the tracker, which the supervisor owns and workers read from disk. `replayWindow` /
+`replay` are supported per-channel registry fields (`examples/01-lateral-coordination/channels.json:6,11`).
 
 ### Routing model
 
@@ -440,7 +444,10 @@ announcements are the supervisor's).
 
 Author `nix-config/agents/cotal/README.md` covering:
 
-1. **Auth bring-up (target):** copy configs into `<workspace>/.cotal/`; `cotal up` (auth is the
+1. **Auth bring-up (target):** the copy of `nix-config/agents/cotal/*` into `<workspace>/.cotal/`
+   is wired by the nix activation `home.activation.installCotalOmpExtension`
+   (`zireael nix-config/shared/dev.nix:719`; the `cotal` CLI shim is `dev.nix:152-160` and the
+   omp `extensions:` wiring is `nix-config/agents/config.yml:21-24`). Then `cotal up` (auth is the
    no-flag default, `up.ts:127`) with `--channels`; start the manager `cotal supervise --spawn
    supervisor` (pty default; `commands.ts:410-413`) or rely on the detached manager
    (`manager-proc.ts:89-93`); the supervisor spawns workers on demand — per-worker creds are
