@@ -9,4 +9,6 @@ allowBuilds:
   '@google/genai': false
   esbuild: true
   msgpackr-extract: false
+  onnxruntime-node: false
   protobufjs: false
+  sharp: false
