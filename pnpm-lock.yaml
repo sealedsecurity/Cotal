@@ -26,6 +26,9 @@ importers:
       '@cotal-ai/core':
         specifier: workspace:*
         version: link:packages/core
+      '@cotal-ai/delivery':
+        specifier: workspace:*
+        version: link:implementations/delivery
       '@cotal-ai/manager':
         specifier: workspace:*
         version: link:implementations/manager
