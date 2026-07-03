@@ -51,7 +51,26 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	const config = configFromEnv();
 	config.connector = "oh-my-pi"; // advertise the host harness on our AgentCard (meta.connector)
 	const agent = new MeshAgent(config);
-	agent.start(); // background connect with retry — never blocks startup
+
+	// Join the mesh only from a real interactive (top-level) session. A `task`/print/RPC subagent
+	// inherits the parent's COTAL_* env, so hasIdentity() alone would make every subagent a stray
+	// same-named peer (polluting the roster + making DMs to that name ambiguous, and worse, a
+	// subagent could receive mesh traffic meant for the main session). `ctx.hasUI` is false in
+	// print/RPC/subagent mode and true for the interactive session — the available signal that
+	// distinguishes them (OMP's internal agentKind "main"|"sub" isn't exposed to extensions).
+	// Deferred to session_start because hasUI is only on the handler ctx, not the factory arg.
+	// NOTE: a future headless launcher (e.g. Compass spawning a real worker) is also hasUI:false and
+	// WOULD need to join — revisit with an explicit signal (agentKind/env opt-in) when that lands.
+	let started = false;
+	pi.on("session_start", (_event, ctx: ExtensionContext) => {
+		if (started) return;
+		started = true;
+		if (!ctx.hasUI) {
+			log("non-interactive session (subagent/print/RPC) — staying off the mesh");
+			return;
+		}
+		agent.start(); // background connect with retry — never blocks
+	});
 
 	const loop = runPeerLoop({ mesh: agent, host: pi });
 
@@ -88,7 +107,7 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	}
 
 	log(
-		`ready — space="${config.space}" name="${config.name}"${config.role ? ` role="${config.role}"` : ""} (${config.servers})`,
+		`loaded — space="${config.space}" name="${config.name}"${config.role ? ` role="${config.role}"` : ""} (${config.servers}); joins the mesh on session_start if interactive`,
 	);
 }
 
