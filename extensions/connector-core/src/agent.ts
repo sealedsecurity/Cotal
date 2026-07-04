@@ -62,7 +62,30 @@ interface Pending {
   ack: () => void;
 }
 
+/** Severity for a connector log line. The default sink maps everything to stderr; an injected
+ *  sink (the in-process oh-my-pi extension passes `pi.logger`) routes by level to a FILE so a
+ *  mesh blip never scribbles on the host TUI's shared terminal. */
+export type MeshLogLevel = "info" | "warn" | "error";
+
+/** Where a {@link MeshAgent}'s diagnostics go. Default: one prefixed line per call to stderr —
+ *  correct for the out-of-process connectors (Claude Code MCP, OpenCode, Hermes) that own their
+ *  stderr. An in-process host (oh-my-pi) MUST inject its own file logger, or reconnect churn
+ *  corrupts the rendered screen. */
+export type MeshLogger = (msg: string, level?: MeshLogLevel) => void;
+
 const MAX_INBOX = 200;
+
+/** Backoff ceiling for the initial-connect + self-heal retry loops. Growth from the first
+ *  `retryMs` is exponential up to this, so a mesh that's down at launch (or dropped mid-session)
+ *  is retried politely rather than hammered every 3s. */
+const MAX_RETRY_MS = 30_000;
+
+/** Default diagnostics sink: one prefixed line per call to stderr. Correct for the out-of-process
+ *  connectors (Claude Code MCP, OpenCode, Hermes) that own their own stderr; the in-process
+ *  oh-my-pi extension injects a file logger instead so mesh churn can't corrupt the TUI. */
+function defaultLogger(msg: string, _level?: MeshLogLevel): void {
+  process.stderr.write(`[cotal-connector] ${msg}\n`);
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -110,10 +133,22 @@ export class MeshAgent extends EventEmitter {
    *  published after it ("since you entered focus"). Undefined unless in focus. */
   private focusSince?: number;
   private stopping = false;
+  /** Diagnostics sink. Defaults to one prefixed stderr line per call; an in-process host injects
+   *  a file logger so mesh churn never touches the shared terminal. */
+  private readonly logger: MeshLogger;
+  /** Connectivity as last OBSERVED from the endpoint's `connection` event — drives the
+   *  drop/recover edge so a lost mesh logs ONCE, not every retry. Starts true so the first
+   *  `connection:false` before any connect (initial-connect failure) isn't mis-logged as a "drop";
+   *  the initial-connect banner is {@link connectLoop}'s job. */
+  private _observedConnected = true;
+  /** The last `endpoint error` text logged while connected — suppresses an identical consecutive
+   *  repeat (a connected-but-flapping error) without hiding a genuinely new one. */
+  private lastLoggedError?: string;
 
-  constructor(config: AgentConfig) {
+  constructor(config: AgentConfig, logger?: MeshLogger) {
     super();
     this.config = config;
+    this.logger = logger ?? defaultLogger;
     // Seed per-channel attention from the operator's file default (one-way: the runtime never writes
     // back — the persona file is a shared template). muted/quiet are validated disjoint at file load.
     for (const c of config.quiet ?? []) this.channelModes.set(c, "quiet");
@@ -142,11 +177,11 @@ export class MeshAgent extends EventEmitter {
       },
     });
     this.ep.on("message", (m: CotalMessage, d: Delivery, meta?: MessageMeta) => this.ingest(m, d, meta));
-    this.ep.on("error", (e: Error) => this.log(`endpoint error: ${e.message}`));
+    this.ep.on("error", (e: Error) => this.onEndpointError(e));
     // The endpoint's (re)binds are the single source of truth for connectedness: this fires on
     // initial start, manual reconnect, AND the background self-heal — so a recovery the endpoint
     // did on its own can't leave us thinking we're offline (which would skip stop() → leak).
-    this.ep.on("connection", (e: { connected: boolean }) => { this._connected = e.connected; });
+    this.ep.on("connection", (e: { connected: boolean }) => this.onConnectionChange(e.connected));
   }
 
   get id(): string {
@@ -163,22 +198,32 @@ export class MeshAgent extends EventEmitter {
     this._contextId = clean ? clean : undefined;
   }
 
-  /** Begin connecting (with background retry). Returns immediately. */
+  /** Begin connecting (with background retry). Returns immediately. `retryMs` is the FIRST
+   *  backoff; it grows exponentially to {@link MAX_RETRY_MS} so a mesh that's down at launch is
+   *  retried politely, not hammered every 3s. */
   start(retryMs = 3000): void {
     void this.connectLoop(retryMs);
   }
 
   private async connectLoop(retryMs: number): Promise<void> {
+    let delay = retryMs;
     while (!this.stopping && !this._connected) {
       try {
         await this.ep.start();
         // _connected is set by the endpoint's "connection" event (fired inside start()), not here.
         this.log(
           `connected to ${this.config.servers} as ${this.who()} in space "${this.config.space}" on #${this.config.subscribe.join(", #")}`,
+          "info",
         );
       } catch (e) {
-        this.log(`mesh unreachable (${(e as Error).message}); retrying in ${retryMs}ms`);
-        await sleep(retryMs);
+        // Log the FIRST failure of an outage once (at warn), then stay quiet through the retries —
+        // the drop/recover edge is tracked by _observedConnected so a down mesh never floods.
+        if (this._observedConnected) {
+          this._observedConnected = false;
+          this.log(`mesh unreachable (${(e as Error).message}); retrying in the background`, "warn");
+        }
+        await sleep(delay);
+        delay = Math.min(delay * 2, MAX_RETRY_MS);
       }
     }
   }
@@ -721,7 +766,34 @@ export class MeshAgent extends EventEmitter {
     }
   }
 
-  private log(msg: string): void {
-    process.stderr.write(`[cotal-connector] ${msg}\n`);
+  /** React to an endpoint connectivity change (initial connect, manual reconnect, or background
+   *  self-heal). The drop → recover edges each log ONCE, so a mesh outage can't flood the host:
+   *  the endpoint's `reestablishLoop` emits an `error` per failed retry, all of which
+   *  {@link onEndpointError} then suppresses while we're disconnected. */
+  private onConnectionChange(connected: boolean): void {
+    const was = this._observedConnected;
+    this._connected = connected;
+    this._observedConnected = connected;
+    if (was && !connected) {
+      this.log("mesh connection lost — retrying in the background", "warn");
+    } else if (!was && connected) {
+      this.lastLoggedError = undefined; // a fresh connection: the next genuine error is worth logging
+      this.log("reconnected to the mesh", "info");
+    }
+  }
+
+  /** An endpoint `error`. While DISCONNECTED it's reconnect churn (the `reestablishLoop` TIMEOUT
+   *  per retry) — suppressed, since {@link onConnectionChange} already logged the drop once. While
+   *  connected it's a genuine, actionable fault (e.g. an ACL denial); log it, deduping an identical
+   *  consecutive repeat so a flapping error can't spam either. */
+  private onEndpointError(e: Error): void {
+    if (!this._connected) return;
+    if (e.message === this.lastLoggedError) return;
+    this.lastLoggedError = e.message;
+    this.log(`endpoint error: ${e.message}`, "error");
+  }
+
+  private log(msg: string, level: MeshLogLevel = "info"): void {
+    this.logger(msg, level);
   }
 }

@@ -33,15 +33,21 @@ import {
 	cotalToolSpecs,
 	type CotalToolSpec,
 	type ToolResult,
+	type MeshLogger,
 } from "@cotal-ai/connector-core";
 import type { PresenceStatus } from "@cotal-ai/core";
 import { runPeerLoop } from "./interactive-loop.js";
 
-function log(msg: string): void {
-	process.stderr.write(`[cotal-mesh] ${msg}\n`);
-}
-
 export default function cotalMesh(pi: ExtensionAPI): void {
+	// Route every connector diagnostic through OMP's FILE logger, never the shared terminal:
+	// a raw stderr write corrupts the live TUI, and mesh reconnect churn would otherwise flood it.
+	const log: MeshLogger = (msg, level = "info") => {
+		const line = `[cotal-mesh] ${msg}`;
+		if (level === "error") pi.logger.error(line);
+		else if (level === "warn") pi.logger.warn(line);
+		else pi.logger.info(line);
+	};
+
 	// No identity → a plain `omp`, not a launcher-joined session. Stay off the mesh.
 	if (!hasIdentity()) {
 		log("no COTAL_NAME / COTAL_LINK / COTAL_AGENT_FILE — staying off the mesh");
@@ -50,7 +56,7 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 
 	const config = configFromEnv();
 	config.connector = "oh-my-pi"; // advertise the host harness on our AgentCard (meta.connector)
-	const agent = new MeshAgent(config);
+	const agent = new MeshAgent(config, log);
 
 	// Join the mesh only from a real interactive (top-level) session. A `task`/print/RPC subagent
 	// inherits the parent's COTAL_* env, so hasIdentity() alone would make every subagent a stray
