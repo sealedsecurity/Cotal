@@ -221,6 +221,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/core
 
+  extensions/zellij:
+    dependencies:
+      '@cotal-ai/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+
   implementations/cli:
     dependencies:
       '@clack/prompts':
