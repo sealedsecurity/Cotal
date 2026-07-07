@@ -553,23 +553,27 @@ export class CotalEndpoint extends EventEmitter {
     }
   }
 
-  /** Rebuild with backoff until it sticks or we're stopped. Interruptible: a manual
-   *  {@link reconnect} kicks the backoff so the next attempt runs immediately instead of
-   *  awaiting the full retryMs. One loop at a time ({@link reestablishing}); concurrent
-   *  triggers coalesce via {@link rebuild}. */
+  /** Rebuild with exponential backoff until it sticks or we're stopped. The delay grows
+   *  `retryMs · 2^attempt` capped at 30s, so a mesh that stays down is retried politely rather
+   *  than every 3s. A manual {@link reconnect} doesn't wait on this loop — it awaits
+   *  {@link rebuild} directly ({@link kickBackoff} wakes any in-flight sleep so the running loop
+   *  doesn't linger). The growth resets on its own: a successful rebuild ends the loop, so the
+   *  next outage starts a fresh one at attempt 0. One loop at a time ({@link reestablishing});
+   *  concurrent triggers coalesce via {@link rebuild}. */
   private async reestablishLoop(): Promise<void> {
     if (this.reestablishing) return;
     this.reestablishing = true;
     try {
-      while (!this.stopped) {
+      for (let attempt = 0; !this.stopped; attempt++) {
         try {
           await this.rebuild();
           return; // success — re-armed; the supervisor re-triggers on the next terminal close
         } catch (e) {
           if (!this.stopped) this.emit("error", e as Error);
+          const delay = Math.min(30_000, this.retryMs * 2 ** attempt);
           await new Promise<void>((resolve) => {
             this.backoffResolve = resolve;
-            this.backoffTimer = setTimeout(resolve, this.retryMs);
+            this.backoffTimer = setTimeout(resolve, delay);
           });
         }
       }
