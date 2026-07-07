@@ -6,6 +6,7 @@ import {
   type AgentHandle,
   type LaunchSpec,
   type Pane,
+  type Placement,
   type Runtime,
   type RuntimeProvider,
   type Tab,
@@ -76,7 +77,7 @@ function cmuxLayout(label: string, tab: Tab): string {
 export class CmuxRuntime implements Runtime {
   readonly kind = "cmux";
 
-  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+  spawn(name: string, spec: LaunchSpec, cwd: string, _placement?: Placement): AgentHandle {
     // `name` becomes a temp-script key and a `cotal-<name>` tab id — keep it a bare token
     // so it can't traverse paths or break the workspace label.
     if (!/^[A-Za-z0-9_.-]+$/.test(name))

@@ -3,10 +3,11 @@
  * Run from the repo root: pnpm exec tsx extensions/zellij/smoke.ts
  * Uses a real background zellij session; cleans up on pass or fail.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { registry } from "@cotal-ai/core";
 import * as zellij from "./src/driver.js";
 import { ZellijRuntime, zellijRuntimeProvider, zellijTerminalProvider } from "./src/runtime.js";
+import { seedFromDump, generateKdl, type LayoutMap } from "./src/layout-map.js";
 
 const SESSION = "cotal-zellij-smoke";
 let passed = 0;
@@ -39,6 +40,51 @@ function cleanup(): void {
   } catch {
     /* no such session — fine */
   }
+}
+
+// ── layout-map (pure — no live zellij) ──────────────────────────────────────
+// These run everywhere, including a zellij-less box, since seedFromDump/generateKdl are pure.
+console.log("\n── layout-map (pure) ────────────────────────────");
+{
+  const map: LayoutMap = {
+    version: 1,
+    tabs: [
+      { label: "supervisor", panes: [{}] },
+      {
+        label: "sealed",
+        stacked: true,
+        panes: [
+          { command: "/usr/bin/env", cwd: "/tmp" },
+          { command: "/usr/bin/env", cwd: "/tmp" },
+        ],
+      },
+    ],
+  };
+  const kdl = generateKdl(map);
+  // Full-session grammar: a top-level `layout {`, one `tab name="…"` per tab, a new_tab_template.
+  ok("generateKdl emits a full-session layout block", kdl.startsWith("layout {"));
+  ok("generateKdl emits the supervisor tab", kdl.includes('tab name="supervisor"'));
+  ok("generateKdl emits the sealed tab", kdl.includes('tab name="sealed"'));
+  ok("generateKdl marks the stacked tab", kdl.includes("pane stacked=true {"));
+  ok("generateKdl emits a new_tab_template", kdl.includes("new_tab_template {"));
+  // Expanded body grammar (not the compact single-line form that fails to deserialize).
+  ok("generateKdl uses expanded pane bodies", kdl.includes('pane command="/usr/bin/env" {'));
+  ok("generateKdl never emits a compact body", !/\{ *cwd .*; /.test(kdl));
+
+  // seedFromDump parses a full-session dump back into a map (round-trip of the shape).
+  const seeded = seedFromDump(kdl);
+  ok("seedFromDump recovers both tabs", seeded.tabs.length === 2);
+  ok(
+    "seedFromDump recovers the supervisor label",
+    seeded.tabs[0]?.label === "supervisor",
+  );
+  ok("seedFromDump recovers the stacked flag", seeded.tabs[1]?.stacked === true);
+  ok(
+    "seedFromDump recovers the sealed panes' commands",
+    seeded.tabs[1]?.panes.every((p) => p.command === "/usr/bin/env"),
+  );
+  // Malformed input degrades to an empty map (best-effort seed, never throws).
+  ok("seedFromDump tolerates junk", seedFromDump("not a layout").tabs.length === 0);
 }
 
 // Needs a real zellij. Skip cleanly where it isn't installed (local `pnpm check` on a zellij-less
@@ -137,6 +183,78 @@ ok("mergedArgv does NOT contain '-i'", !merged.includes("-i"));
 throws("isolatedArgv rejects an unsafe env var name", () =>
   zellij.isolatedArgv({ "BAD NAME": "x" }, "echo", []),
 );
+
+console.log("\n── placement (pane-into-tab; needs an attached client) ──");
+// Pane-id ops (list-panes / focus-pane-id / close-pane -p) are only reliable with a client attached
+// (verified): a background session's focus is stuck and pane-ids aren't introspectable. So fork a
+// real `zellij attach` client for this section, then tear it down. Agents use an ABSOLUTE command —
+// `isolatedArgv` wraps in `env -i`, which strips PATH, so a bare name wouldn't resolve.
+{
+  const PSESSION = "cotal-zellij-smoke-placement";
+  // The client needs a PTY to actually attach — `spawn(..., {stdio:"ignore"})` gives no TTY and the
+  // attach no-ops. `script -qec "<cmd>" /dev/null` runs the command under a PTY. If `script` isn't on
+  // PATH (util-linux), skip the live-placement section honestly rather than report false failures.
+  let hasScript = true;
+  try {
+    execFileSync("script", ["--version"], { stdio: "ignore" });
+  } catch {
+    hasScript = false;
+  }
+  if (!hasScript) {
+    console.log("  ⏭  `script` (util-linux) not available — skipping live placement (pane-id ops need an attached client).");
+  } else {
+    try {
+      execFileSync("zellij", ["delete-session", "--force", PSESSION], { stdio: "ignore" });
+    } catch {
+      /* none — fine */
+    }
+    zellij.ensureSession(PSESSION);
+    // Attach a client under a PTY, in its own session (detached) so we can reap the whole group.
+    const client = spawn("script", ["-qec", `zellij attach ${PSESSION}`, "/dev/null"], {
+      stdio: "ignore",
+      detached: true,
+    });
+    await new Promise((r) => setTimeout(r, 1500)); // let the client attach + paint
+
+    try {
+      const rt = new ZellijRuntime(PSESSION);
+      const place = { tab: "lane", stacked: true } as const;
+      const a = rt.spawn("laneA", { command: "/usr/bin/env", args: ["sleep", "600"] }, "/tmp", place);
+      const b = rt.spawn("laneB", { command: "/usr/bin/env", args: ["sleep", "600"] }, "/tmp", place);
+      await new Promise((r) => setTimeout(r, 900));
+
+      ok("placement: both agents land in one tab (create-on-demand)", zellij.tabNames(PSESSION).includes("lane"));
+      ok("placement: laneA is running", a.status() === "running");
+      ok("placement: laneB is running", b.status() === "running");
+
+      // ad-hoc tab still works after placement (the fluid-tab guarantee).
+      zellij.goToTabNameCreate(PSESSION, "adhoc");
+      ok("placement: an ad-hoc tab can still be created after placement", zellij.tabNames(PSESSION).includes("adhoc"));
+
+      // Per-pane teardown: stopping laneA leaves laneB alive (shared tab, precise close).
+      a.stop({ graceful: false });
+      await new Promise((r) => setTimeout(r, 700));
+      ok("placement: laneA exited after per-pane stop", a.status() === "exited");
+      ok("placement: laneB still running (sibling untouched)", b.status() === "running");
+
+      b.stop({ graceful: false });
+      await new Promise((r) => setTimeout(r, 500));
+      ok("placement: laneB exited after its own stop", b.status() === "exited");
+    } finally {
+      // Reap the client's process group (script + its zellij child).
+      try {
+        if (client.pid) process.kill(-client.pid);
+      } catch {
+        /* already gone */
+      }
+      try {
+        execFileSync("zellij", ["delete-session", "--force", PSESSION], { stdio: "ignore" });
+      } catch {
+        /* none — fine */
+      }
+    }
+  }
+}
 
 console.log("\n────────────────────────────────────────────────");
 console.log(`\n${passed} passed, ${failed} failed\n`);

@@ -13,3 +13,11 @@ imported (no silent fallback to pty). Lifecycle keys off the stable numeric tab 
 returns. Because zellij takes the launch command structurally as argv over its control socket
 (not a rendered command line), secret env values never appear in `dump-layout`/`ps` — so no
 launcher-script indirection is needed.
+
+Adds **per-agent placement**: `Runtime.spawn` takes an optional `placement` (target tab by name,
+created on demand; stacked/floating/split), so a wave lands each agent as a pane in a named lane
+tab of the shared session. Only zellij reads it; the other runtimes accept and ignore it. A pure
+`layout-map` module (`seedFromDump`/`generateKdl`) turns a `dump-layout` into a full-session KDL
+that boots via top-level `zellij --layout`, for fresh-boot wave restart. Per-agent `placement`
+threads through the manifest → resolve → spawn chain (`runtime: zellij` + `placement` on an agent
+entry), and `--runtime zellij` is selectable from both runtime allow-lists.

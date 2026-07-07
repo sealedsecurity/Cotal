@@ -7,3 +7,10 @@
 export * as zellij from "./driver.js";
 // importing registers the zellij runtime + terminal-layout providers
 export { ZellijRuntime, zellijRuntimeProvider, zellijTerminalProvider } from "./runtime.js";
+export {
+  type LayoutMap,
+  type LayoutTab,
+  type LayoutPane,
+  seedFromDump,
+  generateKdl,
+} from "./layout-map.js";

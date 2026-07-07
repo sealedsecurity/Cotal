@@ -29,6 +29,16 @@ const AgentEntryObject = z
     capabilities: z.array(z.string().min(1)).optional(),
     /** Per-agent override of the top-level `personaPermissions` policy. */
     personaPermissions: PersonaPermissions.optional(),
+    /** Zellij placement: which tab this agent's pane lands in and its shape. Only the zellij runtime
+     *  reads it; other runtimes accept-and-ignore, so the manifest stays valid under any backend. */
+    placement: z
+      .strictObject({
+        tab: z.string().min(1).optional(),
+        stacked: z.boolean().optional(),
+        floating: z.boolean().optional(),
+        direction: z.enum(["right", "down"]).optional(),
+      })
+      .optional(),
   })
   .refine((v) => v.persona !== undefined || v.model !== undefined || v.variant !== undefined || v.instructions !== undefined, {
     message:
@@ -73,7 +83,7 @@ export const MeshManifestSchema = z.strictObject({
   kind: z.literal("Mesh"),
   space: z.string().min(1),
   broker: Broker.optional(),
-  runtime: z.enum(["pty", "tmux", "cmux"]).optional(),
+  runtime: z.enum(["pty", "tmux", "cmux", "zellij"]).optional(),
   /** Default connector for agents that don't set their own `agent:`. */
   agent: z.string().min(1).optional(),
   personaPermissions: PersonaPermissions.optional(),

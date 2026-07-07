@@ -31,6 +31,7 @@ export function hashAgent(a: PreparedAgent): string {
     subscribe: [...a.policy.subscribe].sort(),
     allowSubscribe: [...a.policy.allowSubscribe].sort(),
     allowPublish: [...a.policy.allowPublish].sort(),
+    placement: a.placement ?? null,
   });
   return createHash("sha256").update(stable).digest("hex").slice(0, 16);
 }
@@ -50,6 +51,7 @@ function toLaunchAgent(a: PreparedAgent): MeshLaunchAgent {
     allowSubscribe: a.policy.allowSubscribe,
     allowPublish: a.policy.allowPublish,
     personaPath: a.persona,
+    placement: a.placement,
     hash: hashAgent(a),
   };
 }

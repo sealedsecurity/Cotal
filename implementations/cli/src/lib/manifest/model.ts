@@ -3,7 +3,7 @@
  * normalize/invert → semantic), with channel-centric membership inverted into per-agent ACLs.
  * Preflight (persona reads + the `include` merge) and the plan/apply stages consume this.
  */
-import type { ChannelDefaults, DeliveryClass } from "@cotal-ai/core";
+import type { ChannelDefaults, DeliveryClass, Placement } from "@cotal-ai/core";
 
 export type PersonaPermissions = "reject" | "include";
 
@@ -57,13 +57,15 @@ export interface ResolvedAgent {
   personaPermissions: PersonaPermissions;
   /** ACLs inverted from the channels this agent appears in (pre persona-merge). */
   policy: AgentPolicy;
+  /** Zellij pane placement (which tab + shape). Only the zellij runtime reads it. */
+  placement?: Placement;
 }
 
 /** The fully resolved, validated manifest — channel-centric on disk, per-agent here. */
 export interface ResolvedManifest {
   space: string;
   broker?: { servers?: string; host?: string; auth?: boolean };
-  runtime?: "pty" | "tmux" | "cmux";
+  runtime?: "pty" | "tmux" | "cmux" | "zellij";
   personaPermissions: PersonaPermissions;
   defaults?: ChannelDefaults;
   agents: ResolvedAgent[];

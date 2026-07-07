@@ -69,6 +69,13 @@ function isTabGone(err: unknown): boolean {
   return /no tab|not found|does not exist|no such|couldn't find|unknown tab/i.test(msg);
 }
 
+function isPaneGone(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // `close-pane -p <id>` exits 0 even for an unknown id (verified), so this catch is defensive: a
+  // future zellij could error on a gone pane. Treat a not-found/no-such-pane message as a no-op.
+  return /no pane|not found|does not exist|no such|couldn't find|unknown pane/i.test(msg);
+}
+
 /** Render `env` as `KEY=value` argv tokens for `env -i`. Reject any KEY that isn't a valid env
  *  identifier — defense-in-depth, matching the tmux driver, even though zellij takes argv
  *  structurally (no shell splice). Values pass through verbatim as their own argv elements. */
@@ -130,19 +137,75 @@ export function openTab(
   return id;
 }
 
-/** Open a new pane in the focused tab running `argv`, rooted at `cwd`, split along `direction`.
- *  Returns the created pane id (`terminal_<n>`). Used by the layout path (multi-pane tabs). */
+/** Open a new pane in the focused tab running `argv`, rooted at `cwd`, with a shape. `stacked` adds
+ *  the pane to the tab's stack (the lane default), `floating` floats it, otherwise it splits along
+ *  `direction` (default "down"). Returns the created pane id (`terminal_<n>`). The pane lands in the
+ *  currently-focused tab, so callers focus the target tab first (see `goToTabNameCreate`). */
 export function newPane(
   session: string,
   argv: string[],
   cwd: string,
-  direction: "right" | "down",
+  opts: { stacked?: boolean; floating?: boolean; direction?: "right" | "down" } = {},
 ): string {
+  const shape = opts.stacked
+    ? ["--stacked"]
+    : opts.floating
+      ? ["--floating"]
+      : ["--direction", opts.direction ?? "down"];
   return execFileSync(
     "zellij",
-    actionArgs(session, ["new-pane", "--cwd", cwd, "--direction", direction, "--", ...argv]),
+    actionArgs(session, ["new-pane", ...shape, "--cwd", cwd, "--", ...argv]),
     { encoding: "utf8" },
   ).trim();
+}
+
+/** Focus a tab by name, CREATING it if absent (`go-to-tab-name --create`). Subsequent `new-pane`
+ *  calls land in this now-focused tab — the placement path's "put this agent in tab X" primitive.
+ *  Returns `""` (the tab was created or already current); a failure surfaces zellij's own error. */
+export function goToTabNameCreate(session: string, name: string): string {
+  execFileSync("zellij", actionArgs(session, ["go-to-tab-name", name, "--create"]), {
+    stdio: "ignore",
+  });
+  return "";
+}
+
+/** Close a specific pane by its id (`terminal_<n>`), regardless of focus (`close-pane -p <id>`).
+ *  Idempotent: an already-gone pane is a no-op. The precise per-agent teardown primitive for panes
+ *  sharing a tab — closes exactly this pane, leaving its siblings alive. */
+export function closePaneById(session: string, paneId: string): void {
+  try {
+    execFileSync("zellij", actionArgs(session, ["close-pane", "-p", paneId]), { stdio: "pipe" });
+  } catch (err) {
+    if (isPaneGone(err)) return;
+    throw err;
+  }
+}
+
+/** True if `paneId` (`terminal_<n>`) is a live (non-exited) pane in `session`. Reads the session-wide
+ *  `list-panes --json --state`, whose numeric `id` is the suffix of the `terminal_<n>` id. A pane
+ *  the server can't find (or an unreachable session) reads as absent → `false`. */
+export function paneExists(session: string, paneId: string): boolean {
+  const n = Number(paneId.replace(/^terminal_/, ""));
+  if (!Number.isInteger(n)) return false;
+  try {
+    const out = execFileSync(
+      "zellij",
+      actionArgs(session, ["list-panes", "--json", "--state"]),
+      { encoding: "utf8" },
+    );
+    const panes = JSON.parse(out) as Array<{ id: number; is_plugin?: boolean; exited?: boolean }>;
+    return panes.some((p) => p.id === n && !p.is_plugin && !p.exited);
+  } catch {
+    return false;
+  }
+}
+
+/** Focus a specific pane by its id (`terminal_<n>`), across tabs (verified: focuses a pane in a
+ *  non-focused tab). Used before a pane-scoped write (interrupt / graceful `/exit`) so the keystrokes
+ *  land in that agent's pane, not whatever else the tab last focused. Throws if the pane is gone —
+ *  callers that must not fail (deferred teardown) guard it. */
+export function focusPaneId(session: string, paneId: string): void {
+  execFileSync("zellij", actionArgs(session, ["focus-pane-id", paneId]), { stdio: "ignore" });
 }
 
 /** Focus a tab by name. Returns silently; a missing tab surfaces zellij's own error. */

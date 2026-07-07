@@ -8,7 +8,7 @@
  * `include` a persona's own grants are inherited **only for channels the manifest does not declare**
  * (one authority per channel), concrete-only (wildcards rejected), and surfaced loudly.
  */
-import { isConcreteChannel, type AgentDef } from "@cotal-ai/core";
+import { isConcreteChannel, type AgentDef, type Placement } from "@cotal-ai/core";
 import type { AgentPolicy, ResolvedAgent } from "./model.js";
 import type { ManifestIssue } from "./errors.js";
 
@@ -49,6 +49,8 @@ export interface PreparedAgent {
   policy: AgentPolicy;
   /** Persona grants outside manifest channels + inherited caps (empty under `reject`/inline). */
   inherited: InheritedScopes;
+  /** Zellij pane placement (which tab + shape); manifest-only, only the zellij runtime reads it. */
+  placement?: Placement;
 }
 
 export interface PreparedResult {
@@ -142,6 +144,7 @@ export function prepareAgent(agent: ResolvedAgent, persona: AgentDef | undefined
       capabilitySource,
       policy,
       inherited,
+      placement: agent.placement,
     },
     issues,
     warnings,

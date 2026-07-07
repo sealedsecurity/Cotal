@@ -2,6 +2,7 @@ import {
   registry,
   type AgentHandle,
   type LaunchSpec,
+  type Placement,
   type Runtime,
   type RuntimeProvider,
   type Tab,
@@ -38,7 +39,7 @@ export class TmuxRuntime implements Runtime {
 
   constructor(private readonly session: string) {}
 
-  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle {
+  spawn(name: string, spec: LaunchSpec, cwd: string, _placement?: Placement): AgentHandle {
     if (!/^[A-Za-z0-9_.-]+$/.test(name))
       throw new Error(
         `tmux runtime: unsafe agent name ${JSON.stringify(name)} (allowed: letters, digits, _ . -)`,

@@ -32,6 +32,24 @@ const LaunchAgentSchema = z.strictObject({
   allowSubscribe: z.array(z.string()),
   allowPublish: z.array(z.string()),
   personaPath: z.string().optional(),
+  // Placement is manifest-declared; this is the untrusted-input boundary. The tab name is passed as a
+  // STRUCTURAL argv token to `zellij action go-to-tab-name` (never a shell string), so zellij accepts
+  // arbitrary names (verified: slashes, spaces). Guard only against argv/control-char injection: a
+  // non-empty name that can't be mistaken for a flag (no leading `-`) and has no control characters.
+  placement: z
+    .strictObject({
+      tab: z
+        .string()
+        .min(1)
+        .refine((s) => !s.startsWith("-") && !/[\x00-\x1f]/.test(s), {
+          message: "placement.tab must be non-empty, not start with '-', and have no control chars",
+        })
+        .optional(),
+      stacked: z.boolean().optional(),
+      floating: z.boolean().optional(),
+      direction: z.enum(["right", "down"]).optional(),
+    })
+    .optional(),
   hash: z.string().regex(/^[A-Za-z0-9]+$/, "hash must be alphanumeric"),
 });
 
