@@ -26,7 +26,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -35,13 +35,14 @@ import {
   setupSpaceStreams,
   isReachable,
   mintCreds,
+  idFromCreds,
   newIdentity,
   provisionAgent,
   chatSubject,
   CotalEndpoint,
 } from "@cotal-ai/core";
 import { authDir } from "@cotal-ai/workspace";
-import { planAclProvision, provisionAcls } from "../src/lib/acl-provision.js";
+import { planAclProvision, provisionAcls, type AclProvisionResult } from "../src/lib/acl-provision.js";
 import { personasDir } from "../src/lib/personas.js";
 import { resolveNatsServer } from "../src/lib/nats-bin.js";
 
@@ -268,6 +269,52 @@ try {
     { daemonLiveAfter, daemonRow },
   );
 
+  // ── 9. bad creds isolated, siblings still provision ─────────────────────────────────────────
+  // A malformed on-disk creds file must NOT abort the whole catalog pass (pre-fix it threw, leaving
+  // every later persona @mention-wake-blind). planAclProvision isolates it as an error entry and the
+  // loop continues, so a valid sibling is still provisioned. Corrupt baddie's creds AFTER mint so
+  // idFromCreds throws when the routine reads them; goodie is the valid sibling that must survive.
+  const rGolf = freshRoot("golf");
+  writeAgent(rGolf, "goodie", "allowSubscribe: [general, ops]");
+  const goodie = await mintPersona(rGolf, "goodie", ["general", "ops"]);
+  writeAgent(rGolf, "baddie", "allowSubscribe: [general]");
+  const baddie = await mintPersona(rGolf, "baddie", ["general"]);
+  const baddieCreds = join(authDir(rGolf), "creds", "baddie.creds");
+  writeFileSync(baddieCreds, "not-valid-creds-@@@"); // overwrite the real creds with garbage
+  // PRECONDITION the fix guards: the on-disk creds now fail to parse (idFromCreds throws).
+  let parseThrew = false;
+  try {
+    idFromCreds(readFileSync(baddieCreds, "utf8"));
+  } catch {
+    parseThrew = true;
+  }
+  check("[#9 bad-creds] PRECONDITION: the corrupt creds file fails to parse (idFromCreds throws)", parseThrew);
+
+  let r9: AclProvisionResult | undefined;
+  let r9Threw = false;
+  try {
+    r9 = await run(rGolf);
+  } catch (e) {
+    r9Threw = true;
+    console.error("  ! #9 run threw:", (e as Error).message);
+  }
+  // The crux of the regression: one bad creds file no longer aborts the pass.
+  check("[#9 bad-creds] the catalog pass COMPLETED — run() did not throw on the bad creds file", !r9Threw && r9 !== undefined);
+  check(
+    "[#9 bad-creds] valid sibling 'goodie' is still provisioned despite the bad-creds neighbor",
+    r9?.provisioned.some((p) => p.name === "goodie") ?? false,
+    r9,
+  );
+  const goodieRow = await reader.aclForOwner(goodie.id);
+  check("[#9 bad-creds] goodie's ACL row reads back as [general, ops]", eq(goodieRow, ["general", "ops"]), goodieRow);
+  const baddieSkip = r9?.skipped.find((s) => s.name === "baddie");
+  check(
+    "[#9 bad-creds] baddie is skipped with an 'unreadable creds' reason, never provisioned",
+    /unreadable creds/i.test(baddieSkip?.reason ?? "") && !(r9?.provisioned.some((p) => p.name === "baddie") ?? false),
+    r9,
+  );
+  const baddieRow = await reader.aclForOwner(baddie.id);
+  check("[#9 bad-creds] no ACL row was committed for the corrupt persona", baddieRow === undefined, baddieRow);
   console.log(
     `\nNote: #7/#8 defend the spawn daemon-gate at the ROUTINE BOUNDARY (readDeliveryLease→durableMembership→row),` +
       ` driven by a real lease — not a full connector-fork \`cotal spawn\` (out of harness scope).`,
