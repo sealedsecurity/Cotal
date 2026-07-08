@@ -50,6 +50,11 @@ const AgentEntryObject = z
         (p) => [p.stacked === true, p.floating === true, p.direction !== undefined].filter(Boolean).length <= 1,
         { message: "placement shape is exclusive: set at most one of stacked, floating, direction" },
       )
+      // Reject an empty `placement: {}` — with no field set it's a no-op wrapper (falls back to the
+      // default per-agent-tab path), so require at least one field to carry real intent.
+      .refine((p) => p.tab !== undefined || p.stacked !== undefined || p.floating !== undefined || p.direction !== undefined, {
+        message: "placement must set at least one of tab, stacked, floating, direction (drop the empty wrapper)",
+      })
       .optional(),
   })
   .refine((v) => v.persona !== undefined || v.model !== undefined || v.variant !== undefined || v.instructions !== undefined, {

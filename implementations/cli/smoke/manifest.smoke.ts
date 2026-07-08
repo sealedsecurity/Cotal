@@ -171,6 +171,20 @@ channels:
     allowPublish: [a]
 `, "exclusive");
 
+// empty `placement: {}` is a no-op wrapper → rejected (must carry at least one field).
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement: {}
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "at least one");
+
 // placement.tab starting with '-' (flag-injection) → rejected (mirrors the launch-boundary guard).
 fails(`${HEAD}
 runtime: zellij

@@ -55,6 +55,11 @@ const LaunchAgentSchema = z.strictObject({
       (p) => [p.stacked === true, p.floating === true, p.direction !== undefined].filter(Boolean).length <= 1,
       { message: "placement shape is exclusive: set at most one of stacked, floating, direction" },
     )
+    // An empty `placement: {}` is a no-op wrapper (tab absent ⇒ default per-agent-tab path); require
+    // at least one field so the wrapper always carries intent rather than misleading the reader.
+    .refine((p) => p.tab !== undefined || p.stacked !== undefined || p.floating !== undefined || p.direction !== undefined, {
+      message: "placement must set at least one of tab, stacked, floating, direction (drop the empty wrapper)",
+    })
     .optional(),
   hash: z.string().regex(/^[A-Za-z0-9]+$/, "hash must be alphanumeric"),
 });
