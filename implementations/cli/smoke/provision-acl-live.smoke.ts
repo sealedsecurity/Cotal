@@ -39,6 +39,10 @@ import {
   newIdentity,
   provisionAgent,
   chatSubject,
+  dlvStream,
+  dlvDurable,
+  dmStream,
+  dmDurable,
   CotalEndpoint,
 } from "@cotal-ai/core";
 import { authDir } from "@cotal-ai/workspace";
@@ -315,6 +319,63 @@ try {
   );
   const baddieRow = await reader.aclForOwner(baddie.id);
   check("[#9 bad-creds] no ACL row was committed for the corrupt persona", baddieRow === undefined, baddieRow);
+
+  // ── 10. provision-acl creates the bind-only dm_<id> + dlv_<id> durables, not just the ACL row ──
+  // @mention-wake delivery rides the daemon's fan-out → per-member `dlv_<id>` DELIVER durable, which the
+  // agent BINDS (denied CONSUMER.CREATE on DLV) and `pumpDlv` SILENTLY no-ops when it's absent. A
+  // `cotal mint` + `exec omp` agent has NEITHER the ACL row nor the durables, so the pre-fix ACL-row-only
+  // path left its @mention-wake messages piling undrained in an absent `dlv_<id>`. This defends the fix
+  // that pre-creates BOTH bind-only mailboxes (`provisionDmInbox` + `provisionDlvInbox`) before the row.
+  // Existence is read through the reader's provisioner jsm — that cred holds CONSUMER.INFO on DM/DLV
+  // (provision.ts:883), and `consumers.info` RESOLVES with the durable when present, THROWS (404) when
+  // absent. `manager()` is TS-private on CotalEndpoint but callable at runtime; no public consumer-info
+  // accessor exists and `@nats-io/*` is not a CLI dep (unimportable from this smoke), so this single
+  // documented reach past the private surface is the only path to a jsm here.
+  interface JsmConsumerInfo {
+    manager(): Promise<{ consumers: { info(stream: string, durable: string): Promise<{ name: string }> } }>;
+  }
+  const readerJsmAccess = reader as unknown as JsmConsumerInfo; // see note above — reach the provisioner jsm
+  const jsm = await readerJsmAccess.manager();
+  const consumerName = async (stream: string, durable: string): Promise<string | undefined> => {
+    try {
+      return (await jsm.consumers.info(stream, durable)).name; // resolves iff the durable exists
+    } catch {
+      return undefined; // 404 — the durable was never created
+    }
+  };
+
+  const rHotel = freshRoot("hotel");
+  writeAgent(rHotel, "hotel", "allowSubscribe: [general, ops]");
+  const hotel = await mintPersona(rHotel, "hotel", ["general", "ops"]);
+  await run(rHotel);
+  const dlvName = await consumerName(dlvStream(space), dlvDurable(hotel.id));
+  check(
+    "[#10 dlv-footprint] provision-acl pre-created the bind-only dlv_<id> DELIVER durable",
+    dlvName === dlvDurable(hotel.id),
+    { got: dlvName, want: dlvDurable(hotel.id) },
+  );
+  const dmName = await consumerName(dmStream(space), dmDurable(hotel.id));
+  check(
+    "[#10 dlv-footprint] provision-acl pre-created the bind-only dm_<id> DM durable",
+    dmName === dmDurable(hotel.id),
+    { got: dmName, want: dmDurable(hotel.id) },
+  );
+  // Idempotency: the two new provision calls re-create existing durables as a no-op — a second run must
+  // NOT throw, and BOTH durables must still exist afterward (defends the new calls' "re-runnable" contract).
+  let hotelRerunThrew = false;
+  try {
+    await run(rHotel);
+  } catch (e) {
+    hotelRerunThrew = true;
+    console.error("  ! #10 second run threw:", e instanceof Error ? e.message : e);
+  }
+  const dlvAfter = await consumerName(dlvStream(space), dlvDurable(hotel.id));
+  const dmAfter = await consumerName(dmStream(space), dmDurable(hotel.id));
+  check(
+    "[#10 idempotent] a second run does not throw and both durables still exist (re-create is a no-op)",
+    !hotelRerunThrew && dlvAfter === dlvDurable(hotel.id) && dmAfter === dmDurable(hotel.id),
+    { hotelRerunThrew, dlvAfter, dmAfter },
+  );
   console.log(
     `\nNote: #7/#8 defend the spawn daemon-gate at the ROUTINE BOUNDARY (readDeliveryLease→durableMembership→row),` +
       ` driven by a real lease — not a full connector-fork \`cotal spawn\` (out of harness scope).`,
