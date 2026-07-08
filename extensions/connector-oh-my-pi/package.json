@@ -13,7 +13,9 @@
     }
   },
   "omp": {
-    "extensions": ["./dist/extension.bundle.js"]
+    "extensions": [
+      "./dist/extension.bundle.js"
+    ]
   },
   "engines": {
     "node": ">=22.19.0"
@@ -27,7 +29,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "@oh-my-pi/pi-coding-agent": "^16.2.6",
+    "@oh-my-pi/pi-coding-agent": "^16.3.12",
     "@cotal-ai/connector-core": "workspace:*",
     "tsx": "^4.22.4"
   },
