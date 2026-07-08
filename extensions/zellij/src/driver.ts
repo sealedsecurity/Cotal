@@ -67,20 +67,35 @@ export function hasClient(session: string): boolean {
   }
 }
 
+/** util-linux `script` argv that attaches a headless PTY client to `session`. Uses the portable
+ *  `-qec "<cmd>" /dev/null` command-STRING form, which every `script` supports — NOT the structural
+ *  `-- <cmd>` form, which needs util-linux ≥2.40 and silently no-ops on older `script` (e.g. Ubuntu
+ *  24.04's 2.39: the command never runs, no client attaches, placement fails). `-c` runs `<cmd>`
+ *  under a shell, so the session name is validated against a metacharacter-free charset first
+ *  (`^[A-Za-z0-9_.-]+$`) — the same guard the runtime applies to agent names — keeping the invariant
+ *  that no attacker-controlled shell string is ever built. Throws on an unsafe name (no silent
+ *  fallback). Exported for unit tests. */
+export function scriptAttachArgv(session: string): string[] {
+  if (!/^[A-Za-z0-9_.-]+$/.test(session))
+    throw new Error(
+      `zellij: unsafe session name ${JSON.stringify(session)} (allowed: letters, digits, _ . -)`,
+    );
+  return ["-qec", `zellij attach ${session}`, "/dev/null"];
+}
+
 /** Ensure `session` has an attached client, spawning a detached headless PTY one if none is present.
  *  Returns whether a client is attached on return. The PLACEMENT path needs this: pane-id ops
  *  (`new-pane`/`list-panes`/`close-pane -p`) silently no-op against a client-less background session
  *  — a placed pane never actually spawns and then reads as `exited` (verified on zellij 0.44.3). A
- *  real client makes them reliable; `zellij attach` needs a PTY, so wrap it in `script` (util-linux).
- *  The command is passed via `script`'s STRUCTURAL `-- <cmd> [args…]` form (never `-c "…"`), so the
- *  session name is an argv token — no shell, matching the injection-free invariant of this driver.
+ *  real client makes them reliable; `zellij attach` needs a PTY, so wrap it in `script` (util-linux)
+ *  via {@link scriptAttachArgv} (portable command-string form; session name validated there).
  *  The client is `detached`+`unref`'d so it outlives this process — session-scoped (reaped when the
  *  session is deleted), NOT manager-scoped. The human's own later `zellij attach` simply adds a
  *  second client (zellij multiplexes). Idempotent: skipped when a client (this one, or the human) is
  *  already attached. `script` missing/unspawnable → returns `false` so the caller can fail loud. */
 export function ensureClient(session: string): boolean {
   if (hasClient(session)) return true;
-  const client = spawn("script", ["-qe", "/dev/null", "--", "zellij", "attach", session], {
+  const client = spawn("script", scriptAttachArgv(session), {
     detached: true,
     stdio: "ignore",
   });

@@ -321,6 +321,24 @@ throws("isolatedArgv rejects an unsafe env var name", () =>
   zellij.isolatedArgv({ "BAD NAME": "x" }, "echo", []),
 );
 
+// scriptAttachArgv (portable `script` invocation for ensureClient) — regression for the CI/runner
+// break: the structural `script … -- cmd` form needs util-linux ≥2.40 (silently no-ops on the
+// runner's 2.39, so no client attaches and placement throws). The portable `-qec "<cmd>" /dev/null`
+// string form works on every `script`; injection-safety comes from validating the session charset,
+// not from avoiding the shell. These are pure (no spawn), so they run everywhere.
+const attachArgv = zellij.scriptAttachArgv(SESSION);
+ok("scriptAttachArgv uses the portable -qec string form", attachArgv[0] === "-qec");
+ok("scriptAttachArgv does NOT use the ≥2.40 structural -- form", !attachArgv.includes("--"));
+ok("scriptAttachArgv embeds `zellij attach <session>` as the command string", attachArgv[1] === `zellij attach ${SESSION}`);
+ok("scriptAttachArgv ends with the /dev/null typescript sink", attachArgv.at(-1) === "/dev/null");
+throws("scriptAttachArgv rejects a session name with shell metacharacters", () =>
+  zellij.scriptAttachArgv("evil; rm -rf ~"),
+);
+throws("scriptAttachArgv rejects a session name with $(...) command substitution", () =>
+  zellij.scriptAttachArgv("x$(touch pwned)"),
+);
+ok("scriptAttachArgv accepts the safe session charset (letters, digits, _ . -)", Array.isArray(zellij.scriptAttachArgv("cotal-space_1.2")));
+
 console.log("\n── placement (pane-into-tab; the runtime auto-attaches a client) ──");
 // Regression (greptile P1): placement pane-id ops (new-pane / list-panes / close-pane -p) silently
 // no-op against a client-less background session, so a placed pane never spawns and reads as exited.
