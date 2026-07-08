@@ -142,10 +142,16 @@ export async function resolveTargetOrExit(flags: {
 
 /** Offline sibling of {@link resolveTargetOrExit}: resolve WHICH mesh a command targets from the
  *  registry alone, with the same one-sentence error render, but WITHOUT connecting or pruning. For
- *  read-only/offline paths (e.g. `provision-acl --dry-run`) that must preview against the SAME
- *  resolved catalog the live run would use — a raw `--space`/cwd guess would show a different
- *  persona set than the real command. No `pruneStaleMeshes` (an offline preview must not mutate the
- *  registry) and no broker probe. */
+ *  read-only/offline paths (e.g. `provision-acl --dry-run`) — a raw `--space`/cwd guess would scan a
+ *  different persona set than the real command; resolving through the registry the same way the live
+ *  path does keeps the preview's ROOT/SPACE honest.
+ *
+ *  One deliberate divergence from the live path: `resolveTargetOrExit` calls `pruneStaleMeshes()`
+ *  first (an ONLINE reachability probe that mutates the registry), so on the no-`--space` default it
+ *  can drop a since-dead entry before resolving. This offline preview cannot — probing/mutating would
+ *  break the "offline, side-effect-free" contract — so if a registered mesh has died since it was
+ *  recorded, `--dry-run` may still resolve it where the live run would have pruned it and fallen back.
+ *  Acceptable for a preview (it errs toward showing the recorded target; the live run reconciles). */
 export function resolveTargetNoConnectOrExit(flags: {
   server?: string;
   space?: string;

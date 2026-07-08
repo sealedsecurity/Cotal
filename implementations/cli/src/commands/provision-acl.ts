@@ -32,10 +32,11 @@ export async function provisionAcl(argv: string[]): Promise<void> {
   const root = cotalRoot();
 
   // --dry-run: OFFLINE — show the plan (what would be provisioned/skipped) without a connection.
-  // Resolve the target from the registry FIRST (no connect, no prune) so the preview scans the same
-  // catalog the live run would: a `--space`/out-of-checkout invocation resolves a registered mesh
-  // whose root differs from cwd — planning against raw `cotalRoot()` + `values.space` would preview a
-  // different persona set than the command actually provisions.
+  // Resolve the target from the registry FIRST (offline: no connect, no prune — see the helper's note
+  // on the one stale-entry divergence from the live path) so the preview scans the same catalog the
+  // live run would: a `--space`/out-of-checkout invocation resolves a registered mesh whose root
+  // differs from cwd — planning against raw `cotalRoot()` + `values.space` would preview a different
+  // persona set than the command actually provisions.
   if (values["dry-run"]) {
     const dt = resolveTargetNoConnectOrExit({ server: values.server, space: values.space });
     const space = dt.space;
