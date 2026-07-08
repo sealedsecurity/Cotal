@@ -7,11 +7,8 @@ import { MeshAgent, configFromEnv } from "@cotal-ai/connector-core";
 // upstream type-build fix (can1357/oh-my-pi) is published.
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import {
-  defineTool,
-  Type,
-} from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
-import type { Static } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { z } from "zod";
 import { runPeerLoop } from "./loop.js";
 
 /**
@@ -19,13 +16,17 @@ import { runPeerLoop } from "./loop.js";
  * the agent's final text on the right delivery mode (see runOmpPeer), so the model can't
  * mis-route or duplicate a reply. These just let it see who is present and report its own
  * status. Mirrors the pi / openai-agents / vercel-ai adapters.
+ *
+ * Params are authored in zod (the SDK's canonical schema — `Static` infers `z.infer` first),
+ * so `execute`'s `params` is typed off the schema and the tool satisfies `ToolDefinition`
+ * without the retired TypeBox `defineTool` shim.
  */
-function buildTools(mesh: MeshAgent) {
-  const cotal_roster = defineTool({
+function buildTools(mesh: MeshAgent): ToolDefinition[] {
+  const cotal_roster: ToolDefinition<z.ZodObject<Record<string, never>>> = {
     name: "cotal_roster",
     label: "Cotal roster",
     description: "List the peers currently present on the Cotal mesh.",
-    parameters: Type.Object({}),
+    parameters: z.object({}),
     execute: async () => {
       const peers = mesh.roster();
       const text = peers.length
@@ -33,24 +34,24 @@ function buildTools(mesh: MeshAgent) {
             .map((p) => `${p.card.name}${p.card.role ? `/${p.card.role}` : ""} [${p.status}]`)
             .join("\n")
         : "roster is empty";
-      return { content: [{ type: "text", text }], details: {} };
+      return { content: [{ type: "text", text }] };
     },
-  });
+  };
 
-  const statusParams = Type.Object({
-    status: Type.Union([Type.Literal("idle"), Type.Literal("waiting"), Type.Literal("working")]),
-    activity: Type.Optional(Type.String()),
+  const statusParams = z.object({
+    status: z.enum(["idle", "waiting", "working"]),
+    activity: z.string().optional(),
   });
-  const cotal_status = defineTool({
+  const cotal_status: ToolDefinition<typeof statusParams> = {
     name: "cotal_status",
     label: "Cotal status",
     description: "Update this peer's presence status on the mesh.",
     parameters: statusParams,
-    execute: async (_id: string, params: Static<typeof statusParams>) => {
+    execute: async (_id, params) => {
       await mesh.setStatus(params.status, params.activity);
-      return { content: [{ type: "text", text: `status set to ${params.status}` }], details: {} };
+      return { content: [{ type: "text", text: `status set to ${params.status}` }] };
     },
-  });
+  };
 
   return [cotal_roster, cotal_status];
 }

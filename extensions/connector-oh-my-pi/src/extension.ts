@@ -133,12 +133,16 @@ function registerSpec(
 	});
 
 	if (spec.name === "cotal_inbox") {
-		pi.registerTool({
+		// Empty params (this tool takes none). The explicit `registerTool<…>` generic below pins
+		// `TParams` so the tool registry doesn't infer it from the literal and recurse into
+		// `Static<TParams>` (TS2589, excessively deep) under pi-coding-agent ≥16.3.7.
+		const parameters = z.object({});
+		pi.registerTool<ReturnType<typeof z.object>>({
 			name: spec.name,
 			label: spec.title,
 			description:
 				"Show the peer messages currently waiting for you (incl. focus-mode recall). You don't normally need this — the extension delivers peer messages into your turns automatically; use it to re-check what's pending mid-task. Read-only: it never consumes them.",
-			parameters: z.object({}),
+			parameters,
 			approval: "read",
 			async execute(_id, _params, _signal, _onUpdate, _ctx: ExtensionContext) {
 				return toResult(await spec.run(agent, config, { peek: true }));
@@ -151,7 +155,7 @@ function registerSpec(
 	// host's injected zod (pi.zod) so the schema type matches OMP's tool registry. The cast bridges the
 	// two structurally-identical zod copies at this single boundary (raw shapes are plain objects).
 	const parameters = z.object((spec.schema ?? {}) as Parameters<typeof z.object>[0]);
-	pi.registerTool({
+	pi.registerTool<ReturnType<typeof z.object>>({
 		name: spec.name,
 		label: spec.title,
 		description: spec.description,
