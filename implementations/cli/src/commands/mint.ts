@@ -10,6 +10,7 @@ import {
   newIdentity,
   stripSpaceAuth,
   writeSecretFile,
+  type Identity,
   type Profile,
 } from "@cotal-ai/core";
 import { authDir, loadSpaceAuth } from "@cotal-ai/workspace";
@@ -86,16 +87,34 @@ export async function mint(argv: string[]): Promise<void> {
     allowPublish = splitList(values["allow-publish"]) ?? def?.allowPublish;
     role = def?.role;
   }
-  // Re-mint reuses the SAME identity by default. mint's read/post ACLs come from the persona file,
-  // so re-minting is how an agent's channels get refreshed — but the mesh id, its durable ACL row,
-  // and its dm/dlv durables are all keyed by the nkey public key. Rotating the id on every mint
-  // (the old behavior) orphaned that row + those durables, leaving the agent @mention-wake-blind
-  // until re-provisioned. So: if a creds file already exists here, re-sign its SAME id+seed with the
-  // fresh ACLs; only mint a brand-new identity when there's no creds yet, or --force rotates
-  // deliberately (a compromised key / intentional new identity).
+  // Re-mint reuses the SAME identity by default — but only for the `agent` profile. mint's read/post
+  // ACLs come from the persona file, so re-minting is how an agent's channels get refreshed; and the
+  // mesh id, its durable ACL row, and its dm/dlv durables are all keyed by the nkey public key, so
+  // rotating the id on every mint (the old behavior) orphaned that row + those durables, leaving the
+  // agent @mention-wake-blind until re-provisioned. Observer/admin creds carry no persona-refresh
+  // workflow and no durable footprint to orphan, and silently extending a privileged admin key's
+  // lifetime across re-mints would be surprising — so they always rotate. Reuse only when: agent
+  // profile, a creds file already exists here, and --force did not ask for deliberate rotation
+  // (a compromised key / intentional new identity).
   const out = resolve(values.out ?? join(dir, "creds", `${name}.creds`));
-  const reuse = !values.force && existsSync(out);
-  const identity = reuse ? identityFromCreds(readFileSync(out, "utf8")) : newIdentity();
+  const reuse = profile === "agent" && !values.force && existsSync(out);
+  let identity: Identity;
+  if (reuse) {
+    try {
+      identity = identityFromCreds(readFileSync(out, "utf8"));
+    } catch (e) {
+      // A present-but-unreadable creds file (empty, truncated, or not a user creds file) must fail
+      // loud, not silently rotate — silently minting a fresh id here would orphan the durable row
+      // the existing id may still own. Point the operator at the deliberate-rotation escape hatch.
+      throw new Error(
+        `cotal mint: creds already exist at ${out} but could not be parsed to reuse the identity ` +
+          `(${e instanceof Error ? e.message : String(e)}). Pass --force to mint a fresh identity ` +
+          `(rotates the id), or remove the file if it is stale.`,
+      );
+    }
+  } else {
+    identity = newIdentity();
+  }
   const creds = await mintCreds(auth, identity, profile, { allowSubscribe, allowPublish, role });
   mkSecretDir(dirname(out));
   writeSecretFile(out, creds);
