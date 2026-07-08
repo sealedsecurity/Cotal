@@ -210,8 +210,10 @@ For every `listPersonas(root)` entry (skip `error` entries loudly):
 2. **Creds absent**: mint them exactly as `cotal mint <name> --profile agent` would (`newIdentity()`
    + file-derived policy + `writeSecretFile`) — forced by the id-keyed registry: a row cannot exist
    before an identity does. This is what makes fresh-mesh bring-up one command.
-3. Provision the **full durable-delivery footprint** for `id`, exactly what `provisionAgent` writes
-   for a spawned agent (the scope caveat above): the bind-only `dm_<id>` + `dlv_<id>` mailboxes the
+3. Provision the **full durable-delivery footprint** for `id` — what `provisionAgent` writes when
+   durable membership is enabled (`durableMembership: true`), **not** the live-only
+   `durableMembership: false` path a bare `cotal spawn` takes, which skips the ACL row entirely
+   (`provision.ts:272`; the scope caveat above): the bind-only `dm_<id>` + `dlv_<id>` mailboxes the
    agent cannot self-create (denied `CONSUMER.CREATE` on DM/DLV — only a provisioner may create them),
    then the ACL row. `ep.provisionDmInbox(id)`; `ep.provisionDlvInbox(id)`; `ep.commitAcl(id,
    allowSubscribe)` (`CotalEndpoint.commitAcl(targetId: string, allowSubscribe: string[]): Promise<void>`,
@@ -237,10 +239,14 @@ Surfaces: `cotal provision-acl` command (fail-loud, re-runnable, idempotent — 
   (`acls.ts:21`).
 - **Test cycle (red first):** new `implementations/cli/smoke/provision-acl.smoke.ts` on the
   delivery-boot-retry harness pattern: spin `nats-server` + `setupSpaceStreams`; lay down persona
-  files + pre-minted creds for one agent, none for another; **red** — assert
-  `readAcl(kv, id)` returns each agent's file-equal `allowSubscribe` (fails today: no writer
-  exists); **green** after implementing; re-run routine ⇒ idempotent; tampered creds (policy
-  drift) ⇒ loud error. Register as `smoke:provision-acl:auth` in root `package.json`.
+  files + pre-minted creds for one agent, none for another; **red** — assert both that
+  `readAcl(kv, id)` returns each agent's file-equal `allowSubscribe` AND that the per-member
+  durables `dm_<id>` + `dlv_<id>` exist (consumer info on the DM/DLV streams resolves, not
+  `consumer not found`) — the row-alone assertion would pass a footprint-incomplete impl that
+  still leaves `pumpDlv` no-op'ing, so the durable checks are what actually guard the bug (all
+  fail today: no writer exists); **green** after implementing; re-run routine ⇒ idempotent (row
+  CAS + durable create-if-absent both no-op cleanly); tampered creds (policy drift) ⇒ loud error.
+  Register as `smoke:provision-acl:auth` in root `package.json`.
 
 ### Task 3 — spawn: provision-when-daemon-live
 
