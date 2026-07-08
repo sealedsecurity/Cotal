@@ -272,9 +272,11 @@ ok("tab alive after spawn", zellij.tabNames(SESSION).includes("smoke-agent"));
 // Regression (status by stable tab id, not mutable name): rename the tab out from under the handle;
 // a name-based status() would now read "exited", the id-based one stays "running". Needs a client to
 // apply the rename (background sessions don't rename clientless) — skip honestly where `script` is absent.
+let liveTabName = "smoke-agent";
 if (zellij.ensureClient(SESSION)) {
   zellij.goToTabName(SESSION, "smoke-agent");
   execFileSync("zellij", ["--session", SESSION, "action", "rename-tab", "smoke-renamed"]);
+  liveTabName = "smoke-renamed";
   await new Promise((r) => setTimeout(r, 400));
   ok("tab renamed (name-based status would be wrong now)", !zellij.tabNames(SESSION).includes("smoke-agent"));
   ok("status() = running AFTER rename (id-based survives it)", handle.status() === "running");
@@ -296,7 +298,7 @@ throws("attach() throws", () => handle.attach());
 
 handle.stop({ graceful: false });
 await new Promise((r) => setTimeout(r, 300));
-ok("renamed tab gone after hard stop (close-by-id ignores the name)", !zellij.tabNames(SESSION).includes("smoke-renamed"));
+ok(`tab "${liveTabName}" gone after hard stop (close-by-id ignores the name)`, !zellij.tabNames(SESSION).includes(liveTabName));
 ok("handle.status() = exited after stop", handle.status() === "exited");
 
 console.log("\n── registry registration ────────────────────────");
@@ -336,6 +338,9 @@ throws("scriptAttachArgv rejects a session name with shell metacharacters", () =
 );
 throws("scriptAttachArgv rejects a session name with $(...) command substitution", () =>
   zellij.scriptAttachArgv("x$(touch pwned)"),
+);
+throws("scriptAttachArgv rejects a session name starting with a dash (CLI-option confusion)", () =>
+  zellij.scriptAttachArgv("--help"),
 );
 ok("scriptAttachArgv accepts the safe session charset (letters, digits, _ . -)", Array.isArray(zellij.scriptAttachArgv("cotal-space_1.2")));
 

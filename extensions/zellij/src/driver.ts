@@ -72,13 +72,14 @@ export function hasClient(session: string): boolean {
  *  `-- <cmd>` form, which needs util-linux ≥2.40 and silently no-ops on older `script` (e.g. Ubuntu
  *  24.04's 2.39: the command never runs, no client attaches, placement fails). `-c` runs `<cmd>`
  *  under a shell, so the session name is validated against a metacharacter-free charset first
- *  (`^[A-Za-z0-9_.-]+$`) — the same guard the runtime applies to agent names — keeping the invariant
+ *  (`^[A-Za-z0-9_.][A-Za-z0-9_.-]*$` — like the runtime's agent-name guard, but also barring a
+ *  leading `-` so a name can't be read as a `zellij attach` CLI option), keeping the invariant
  *  that no attacker-controlled shell string is ever built. Throws on an unsafe name (no silent
  *  fallback). Exported for unit tests. */
 export function scriptAttachArgv(session: string): string[] {
-  if (!/^[A-Za-z0-9_.-]+$/.test(session))
+  if (!/^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/.test(session))
     throw new Error(
-      `zellij: unsafe session name ${JSON.stringify(session)} (allowed: letters, digits, _ . -)`,
+      `zellij: unsafe session name ${JSON.stringify(session)} (allowed: letters, digits, _ . -; not leading -)`,
     );
   return ["-qec", `zellij attach ${session}`, "/dev/null"];
 }
