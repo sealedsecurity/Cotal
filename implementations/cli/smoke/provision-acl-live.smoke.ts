@@ -50,19 +50,14 @@ const SERVERS = `nats://127.0.0.1:${PORT}`;
 const space = `provacl-${randomUUID().slice(0, 8)}`;
 
 function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 function awaitExit(proc: ChildProcess, timeoutMs = 3000): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  if (proc.exitCode !== null || proc.signalCode !== null) {
-    resolve();
-    return promise;
-  }
-  proc.once("exit", () => resolve());
-  setTimeout(resolve, timeoutMs);
-  return promise;
+  return new Promise<void>((resolve) => {
+    if (proc.exitCode !== null || proc.signalCode !== null) return resolve();
+    proc.once("exit", () => resolve());
+    setTimeout(resolve, timeoutMs);
+  });
 }
 const eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -115,14 +110,18 @@ async function mintPersona(root: string, name: string, allowSubscribe?: string[]
   return { id: identity.id, creds };
 }
 
-const dir = mkdtempSync(join(tmpdir(), "cotal-provacl-srv-"));
-writeFileSync(join(dir, "server.conf"), serverConfig(auth, { port: PORT, storeDir: join(dir, "js") }));
-const { bin: natsBin } = await resolveNatsServer();
-const srv = spawn(natsBin, ["-c", join(dir, "server.conf")], { stdio: "ignore" });
-
 let reader: CotalEndpoint | undefined;
 let deliveryEp: CotalEndpoint | undefined;
+let dir: string | undefined;
+let srv: ChildProcess | undefined;
 try {
+  // Server setup lives INSIDE the try so a throw here (e.g. resolveNatsServer can't find the binary)
+  // still hits the finally — no leaked temp dir, no dangling child.
+  dir = mkdtempSync(join(tmpdir(), "cotal-provacl-srv-"));
+  writeFileSync(join(dir, "server.conf"), serverConfig(auth, { port: PORT, storeDir: join(dir, "js") }));
+  const { bin: natsBin } = await resolveNatsServer();
+  srv = spawn(natsBin, ["-c", join(dir, "server.conf")], { stdio: "ignore" });
+  srv.on("error", (e) => console.error("  ! nats-server spawn error:", e.message)); // never let an async spawn error go unhandled (would crash the process before cleanup)
   let up = false;
   for (let i = 0; i < 50; i++) {
     if (await isReachable(SERVERS)) {
@@ -290,9 +289,11 @@ try {
   } catch {
     /* ignore */
   }
-  srv.kill("SIGKILL");
-  await awaitExit(srv);
-  rmSync(dir, { recursive: true, force: true });
+  if (srv) {
+    srv.kill("SIGKILL");
+    await awaitExit(srv);
+  }
+  if (dir) rmSync(dir, { recursive: true, force: true });
   for (const r of roots) rmSync(r, { recursive: true, force: true });
 }
 process.exit(process.exitCode ?? (fail ? 1 : 0)); // force-exit: lingering endpoint reconnect timers keep the loop alive

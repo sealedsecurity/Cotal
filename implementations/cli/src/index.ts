@@ -153,7 +153,7 @@ const baseCommands: Command[] = [
     name: "provision-acl",
     group: "Mesh",
     summary:
-      "write the durable read-ACL row for every persona so the delivery daemon authorizes @mention-wake — provision-acl [--dry-run] [--mint-missing] [--space <s>]; closes the `cotal mint` + `exec omp` gap",
+      "write the durable read-ACL row for every persona-with-creds so the delivery daemon authorizes @mention-wake — provision-acl [--dry-run] [--space <s>]; closes the `cotal mint` + `exec omp` gap",
     run: provisionAcl,
   },
   {

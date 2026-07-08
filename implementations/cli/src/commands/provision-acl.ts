@@ -52,7 +52,11 @@ export async function provisionAcl(argv: string[]): Promise<void> {
     console.error(c.red("provision-acl needs an auth-mode mesh (it mints a privileged provisioner cred) — this target is open/off-registry."));
     process.exit(1);
   }
-  const result = await provisionAcls({ root, space: target.space, server: target.server, auth: target.auth });
+  // Scan the RESOLVED mesh's catalog, not the cwd's: `--space`/out-of-checkout invocations resolve a
+  // registered mesh whose root differs from cwd. `target.root` is set for a registry-resolved auth mesh
+  // (guaranteed here — the `!target.auth` guard above already exited an off-registry target); fall back
+  // to the cwd root defensively.
+  const result = await provisionAcls({ root: target.root ?? root, space: target.space, server: target.server, auth: target.auth });
   for (const p of result.provisioned)
     console.log(`  ${c.green("✓")} ${p.name.padEnd(16)} [${p.allowSubscribe.join(", ")}]`);
   for (const s of result.skipped) console.log(`  ${c.yellow("skip")} ${s.name.padEnd(16)} ${s.reason}`);

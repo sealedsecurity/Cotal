@@ -78,17 +78,24 @@ export function planAclProvision(root: string, space: string): AclProvisionPlanE
       plan.push({ name: p.name, allowSubscribe, hasCreds: false });
       continue;
     }
-    const creds = readFileSync(credsPath, "utf8");
-    const id = idFromCreds(creds);
-    // Parity: the file-derived ACL must render to the same chat sub.allow the creds carry, or the
-    // durable read scope would diverge from the live one. Compare as sorted sets.
-    const want = allowSubscribe.map((ch) => chatSubject(space, "*", ch)).sort();
-    const have = credChatSubAllow(creds, space);
-    const drift =
-      JSON.stringify(want) === JSON.stringify(have)
-        ? undefined
-        : `creds read scope [${have.join(", ")}] != file ACL [${want.join(", ")}] — re-mint ${p.name}`;
-    plan.push({ name: p.name, id, allowSubscribe, hasCreds: true, drift });
+    // A malformed/truncated/mismatched creds file must not abort the WHOLE catalog pass (that would
+    // leave later valid personas @mention-wake-blind). Isolate it as an error entry — provisionAcls
+    // skips just this one and continues.
+    try {
+      const creds = readFileSync(credsPath, "utf8");
+      const id = idFromCreds(creds);
+      // Parity: the file-derived ACL must render to the same chat sub.allow the creds carry, or the
+      // durable read scope would diverge from the live one. Compare as sorted sets.
+      const want = allowSubscribe.map((ch) => chatSubject(space, "*", ch)).sort();
+      const have = credChatSubAllow(creds, space);
+      const drift =
+        JSON.stringify(want) === JSON.stringify(have)
+          ? undefined
+          : `creds read scope [${have.join(", ")}] != file ACL [${want.join(", ")}] — re-mint ${p.name}`;
+      plan.push({ name: p.name, id, allowSubscribe, hasCreds: true, drift });
+    } catch (e) {
+      plan.push({ name: p.name, allowSubscribe, hasCreds: false, error: `unreadable creds: ${e instanceof Error ? e.message : String(e)}` });
+    }
   }
   return plan;
 }
@@ -145,7 +152,7 @@ export async function provisionAcls(opts: {
       // Read-back through the public accessor confirms the row landed (and is what the daemon's reader
       // will see) — a real verification, not just a key tally.
       const back = await ep.aclForOwner(id as string);
-      if (JSON.stringify(back) !== JSON.stringify(e.allowSubscribe))
+      if (JSON.stringify([...(back ?? [])].sort()) !== JSON.stringify([...e.allowSubscribe].sort()))
         throw new Error(`ACL write for ${e.name} did not read back: wrote ${JSON.stringify(e.allowSubscribe)}, read ${JSON.stringify(back)}`);
       result.provisioned.push({ name: e.name, id: id as string, allowSubscribe: e.allowSubscribe });
     }
