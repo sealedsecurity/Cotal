@@ -98,6 +98,13 @@ function turnReplyText(messages: readonly unknown[]): string | undefined {
 export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSession }): PeerLoop {
   const turn = new InboxTurn(mesh);
   let streaming = false; // gates steer(): only valid once the agent is actually streaming
+  // Set once shutdown() begins so a prompt/steer settling mid-teardown can't drive a disposed
+  // session (commit/pump/setStatus on a torn-down loop). Guards the async prompt callback below.
+  let stopped = false;
+  // Folded ids whose steer() has not yet CONFIRMED delivery. agent_end un-surfaces any still
+  // pending (or failed) fold before commit, so a message the model never received is left on the
+  // stream to redeliver rather than falsely acked.
+  const pendingSteerIds = new Set<string>();
 
   const setStatus = (status: "idle" | "working", activity?: string): void => {
     void mesh.setStatus(status, activity).catch(() => {});
@@ -138,17 +145,24 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
   function foldSameScope(): void {
     if (!turn.origin || !streaming) return;
     for (const item of turn.extend((i, o) => actionable(mesh, i) && scopeKey(i) === scopeKey(o))) {
-      // If the steer is rejected the message never reached the model turn — un-surface its id so
-      // the terminal commit() won't ack it. It stays on the stream and redelivers on a later turn.
-      void session.steer(framed(item)).catch((e) => {
-        log(e);
-        turn.unsurface(item.id);
-      });
+      // extend() surfaces synchronously so a re-entrant fold can't re-pick the item, but the steer
+      // is async: hold the id as pending until it CONFIRMS. A steer still pending (or rejected) at
+      // agent_end is un-surfaced there, so a message the model never received redelivers, not acked.
+      pendingSteerIds.add(item.id);
+      void session.steer(framed(item)).then(
+        () => pendingSteerIds.delete(item.id), // delivered → stays surfaced → acked on commit
+        (e) => {
+          log(e);
+          pendingSteerIds.delete(item.id);
+          turn.unsurface(item.id); // rejected → drop from the ack set → redelivers on a later turn
+        },
+      );
     }
   }
 
   function onStartError(e: unknown): void {
     log(e);
+    if (stopped) return; // torn down mid-flight → never commit/pump/status a disposed session
     if (streaming) return; // already running → agent_end will complete the turn
     turn.commit(); // pre-flight failure (e.g. no model/key): drop, no retry-loop
     setStatus("idle");
@@ -181,6 +195,10 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
         // event and the failed turn still ends here, so `agent_end` is always terminal.
         const to = turn.origin;
         const reply = turnReplyText(event.messages);
+        // A fold whose steer hasn't confirmed by turn end (still pending, or rejected) never reached
+        // the model — un-surface it so commit() can't ack it; it redelivers on a later turn.
+        for (const id of pendingSteerIds) turn.unsurface(id);
+        pendingSteerIds.clear();
         turn.commit(); // ack the surfaced run — clean or failed both consume (no retry-loop)
         streaming = false;
         if (to && reply) deliver(to, reply);
@@ -195,11 +213,12 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
 
   return {
     async shutdown(): Promise<void> {
+      stopped = true; // block any in-flight prompt/steer callback from driving a disposed session
       if (turn.inFlight) {
         turn.abandon(); // leave the in-flight run on the stream → redeliver, no peer dropped
         await session.abort();
       }
-      await session.dispose();
+      await session.dispose().catch(log); // await async cleanup, but never let a dispose failure skip the caller's mesh.stop()
     },
   };
 }
