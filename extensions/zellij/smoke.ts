@@ -271,13 +271,16 @@ ok("tab alive after spawn", zellij.tabNames(SESSION).includes("smoke-agent"));
 
 // Regression (status by stable tab id, not mutable name): rename the tab out from under the handle;
 // a name-based status() would now read "exited", the id-based one stays "running". Needs a client to
-// apply the rename (background sessions don't rename clientless).
-zellij.ensureClient(SESSION);
-zellij.goToTabName(SESSION, "smoke-agent");
-execFileSync("zellij", ["--session", SESSION, "action", "rename-tab", "smoke-renamed"]);
-await new Promise((r) => setTimeout(r, 400));
-ok("tab renamed (name-based status would be wrong now)", !zellij.tabNames(SESSION).includes("smoke-agent"));
-ok("status() = running AFTER rename (id-based survives it)", handle.status() === "running");
+// apply the rename (background sessions don't rename clientless) — skip honestly where `script` is absent.
+if (zellij.ensureClient(SESSION)) {
+  zellij.goToTabName(SESSION, "smoke-agent");
+  execFileSync("zellij", ["--session", SESSION, "action", "rename-tab", "smoke-renamed"]);
+  await new Promise((r) => setTimeout(r, 400));
+  ok("tab renamed (name-based status would be wrong now)", !zellij.tabNames(SESSION).includes("smoke-agent"));
+  ok("status() = running AFTER rename (id-based survives it)", handle.status() === "running");
+} else {
+  console.log("  ⏭  no client (`script` absent) — skipping the rename-under-handle regression.");
+}
 
 // E2E no-leak: the secret env VALUE must not appear in zellij's queryable layout — env rides the
 // structural argv over the control socket (env -i), never a rendered command line.
