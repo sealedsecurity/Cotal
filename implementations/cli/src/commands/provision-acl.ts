@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 import { planAclProvision, provisionAcls } from "../lib/acl-provision.js";
-import { resolveTargetOrExit } from "../lib/connect.js";
+import { resolveTargetNoConnectOrExit, resolveTargetOrExit } from "../lib/connect.js";
 import { cotalRoot } from "../lib/paths.js";
 import { c } from "../ui.js";
 
@@ -32,9 +32,14 @@ export async function provisionAcl(argv: string[]): Promise<void> {
   const root = cotalRoot();
 
   // --dry-run: OFFLINE — show the plan (what would be provisioned/skipped) without a connection.
+  // Resolve the target from the registry FIRST (no connect, no prune) so the preview scans the same
+  // catalog the live run would: a `--space`/out-of-checkout invocation resolves a registered mesh
+  // whose root differs from cwd — planning against raw `cotalRoot()` + `values.space` would preview a
+  // different persona set than the command actually provisions.
   if (values["dry-run"]) {
-    const space = values.space ?? "main";
-    const plan = planAclProvision(root, space);
+    const dt = resolveTargetNoConnectOrExit({ server: values.server, space: values.space });
+    const space = dt.space;
+    const plan = planAclProvision(dt.root ?? root, space);
     console.log(c.bold(`provision-acl (dry run) — space "${space}" — ${plan.length} personas`));
     for (const e of plan) {
       if (e.error) { console.log(`  ${c.red("skip")} ${e.name.padEnd(16)} persona parse error: ${e.error}`); continue; }

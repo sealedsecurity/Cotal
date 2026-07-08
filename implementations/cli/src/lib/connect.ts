@@ -140,6 +140,27 @@ export async function resolveTargetOrExit(flags: {
   return target;
 }
 
+/** Offline sibling of {@link resolveTargetOrExit}: resolve WHICH mesh a command targets from the
+ *  registry alone, with the same one-sentence error render, but WITHOUT connecting or pruning. For
+ *  read-only/offline paths (e.g. `provision-acl --dry-run`) that must preview against the SAME
+ *  resolved catalog the live run would use — a raw `--space`/cwd guess would show a different
+ *  persona set than the real command. No `pruneStaleMeshes` (an offline preview must not mutate the
+ *  registry) and no broker probe. */
+export function resolveTargetNoConnectOrExit(flags: {
+  server?: string;
+  space?: string;
+}): MeshTarget {
+  try {
+    return resolveMeshTarget(process.cwd(), flags);
+  } catch (e) {
+    if (isWorkspaceTargetError(e)) {
+      console.error(c.red(renderWorkspaceError({ kind: "target", error: e })));
+      process.exit(1);
+    }
+    throw e;
+  }
+}
+
 /** Confirm the resolved mesh is up and accepts these creds — replaces the raw NATS "Authorization
  *  Violation" trace with one sentence, and prunes the entry if the broker is gone / mismatched.
  *  The probe + classify + render live in `@cotal-ai/workspace` (shared with the manager control
