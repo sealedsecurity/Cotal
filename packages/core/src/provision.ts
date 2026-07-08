@@ -211,11 +211,12 @@ export interface ProvisionOpts extends MintOpts {
   subscribe?: string[];
   /** Record this agent's read ACL so it can participate in durable delivery (default true). A durable
    *  backstop needs the agent's read ACL in the registry — the server-side delivery daemon re-authorizes
-   *  every durable entry against it — written here at provision. Set FALSE for a LIVE-ONLY launcher
-   *  (e.g. a direct foreground `cotal spawn` with no durable intent): no ACL row is written, so the daemon
-   *  refuses to authorize a durable backstop and the agent stays live-only. Boot durable MEMBERSHIP itself
-   *  is not written here — the agent self-joins its durable channels via the daemon's `ctl.delivery` op at
-   *  connect. */
+   *  every durable entry against it — written here at provision. Set FALSE for a LIVE-ONLY launcher: no
+   *  ACL row is written, so the daemon refuses to authorize a durable backstop and the agent stays
+   *  live-only. Callers gate this on whether a durable backstop is actually reachable — e.g. `cotal spawn`
+   *  passes the result of a delivery-lease probe (daemon live ⇒ true), and `cotal join`'s bare console
+   *  passes false. Boot durable MEMBERSHIP itself is not written here — the agent self-joins its durable
+   *  channels via the daemon's `ctl.delivery` op at connect. */
   durableMembership?: boolean;
 }
 
@@ -242,7 +243,8 @@ export interface DurableProvisioner {
  *  mint its scoped creds. Live delivery is the agent's own core subscription — there is no per-instance
  *  chat durable. Boot durable MEMBERSHIP is not written here: the agent self-joins its durable channels
  *  via the server-side delivery daemon's `ctl.delivery` op at connect. A live-only launcher
- *  (`durableMembership:false`, e.g. direct `cotal spawn`) gets no ACL row and stays live-only. */
+ *  (`durableMembership:false`, e.g. `cotal join`'s bare console, or `cotal spawn` when no delivery
+ *  daemon is live) gets no ACL row and stays live-only. */
 export async function provisionAgent(
   provisioner: DurableProvisioner,
   auth: SpaceAuth,
@@ -900,6 +902,11 @@ function provisionerPermissions(space: string, id: string): Record<string, unkno
         `$JS.API.DIRECT.GET.KV_${aclBucket(space)}.>`, // keyed get: `.>` (the key rides the subject)
         `$JS.API.STREAM.MSG.GET.KV_${channelBucket(space)}`,
         `$JS.API.DIRECT.GET.KV_${channelBucket(space)}.>`, // keyed get: `.>` (the key rides the subject)
+        // Delivery lease/readiness: READ-ONLY (`kv.get` ⇒ STREAM.MSG.GET) — `cotal spawn` probes it to
+        // decide durable-vs-live-only (provision the ACL only when a delivery daemon is live). STREAM.INFO
+        // is already granted in `streamSetup` (the bucket is in `buckets`); no WRITE (only the `delivery`
+        // cred writes the lease). Mirrors the agent's own Component-6 lease read (permissionsFor :474-475).
+        `$JS.API.STREAM.MSG.GET.KV_${deliveryBucket(space)}`,
       ],
     },
     // Replies only: every stream/consumer/KV-create PubAck and JS API response lands on the per-id inbox.
