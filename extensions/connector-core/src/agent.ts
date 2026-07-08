@@ -91,8 +91,8 @@ const MAX_RETRY_MS = 30_000;
 /** Default diagnostics sink: one prefixed line per call to stderr. Correct for the out-of-process
  *  connectors (Claude Code MCP, OpenCode, Hermes) that own their own stderr; the in-process
  *  oh-my-pi extension injects a file logger instead so mesh churn can't corrupt the TUI. */
-function defaultLogger(msg: string, _level?: MeshLogLevel): void {
-  process.stderr.write(`[cotal-connector] ${msg}\n`);
+function defaultLogger(msg: string, level: MeshLogLevel = "info"): void {
+  process.stderr.write(`[cotal-connector:${level}] ${msg}\n`);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -141,6 +141,11 @@ export class MeshAgent extends EventEmitter {
    *  published after it ("since you entered focus"). Undefined unless in focus. */
   private focusSince?: number;
   private stopping = false;
+  /** In-flight connect-retry backoff, so {@link stop} can interrupt it instead of leaking the
+   *  event loop for up to MAX_RETRY_MS when the mesh is unreachable at shutdown. Mirrors the
+   *  endpoint's kickBackoff. */
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private retryResolve?: () => void;
   /** Diagnostics sink. Defaults to one prefixed stderr line per call; an in-process host injects
    *  a file logger so mesh churn never touches the shared terminal. */
   private readonly logger: MeshLogger;
@@ -230,7 +235,14 @@ export class MeshAgent extends EventEmitter {
           this._observedConnected = false;
           this.log(`mesh unreachable (${(e as Error).message}); retrying in the background`, "warn");
         }
-        await sleep(delay);
+        // Cancellable backoff: stop() clears the timer + resolves this so shutdown isn't blocked
+        // for up to MAX_RETRY_MS on an unreachable mesh (the loop then exits on `this.stopping`).
+        await new Promise<void>((resolve) => {
+          this.retryResolve = resolve;
+          this.retryTimer = setTimeout(resolve, delay);
+        });
+        this.retryTimer = undefined;
+        this.retryResolve = undefined;
         delay = Math.min(delay * 2, MAX_RETRY_MS);
       }
     }
@@ -238,6 +250,9 @@ export class MeshAgent extends EventEmitter {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    // Interrupt any in-flight connect-retry backoff so shutdown doesn't wait out the timer.
+    clearTimeout(this.retryTimer);
+    this.retryResolve?.();
     // Unconditional: a background self-heal can flip _connected without us, so a `_connected`
     // guard could skip the stop and leak the live connection/heartbeat/supervisor. ep.stop() is
     // idempotent (early-returns once stopped), so calling it when already-down is a noop.

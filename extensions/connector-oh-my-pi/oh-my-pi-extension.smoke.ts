@@ -81,6 +81,9 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	const inbox = tools.get("cotal_inbox")!;
 	assert(inbox.approval === "read", "cotal_inbox is approval:read");
 	// Its schema takes no args (peek is forced), so execute must run without throwing on {}.
+	const inboxResult = await inbox.execute("", {}, undefined, undefined, undefined);
+	assert(inboxResult.content.length === 1, "cotal_inbox execute returns one content part");
+	assert(!inboxResult.content[0].text.startsWith("⚠"), "cotal_inbox execute does not error on empty inbox");
 	console.log("3) cotal_inbox read-only OK ✅");
 
 	// The factory started a MeshAgent with a background reconnect loop; fire session_shutdown to stop

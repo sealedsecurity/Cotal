@@ -81,7 +81,10 @@ export async function runOmpPeer(): Promise<void> {
 
   const loop = runPeerLoop({ mesh, session });
 
+  let shuttingDown = false;
   async function shutdown(): Promise<void> {
+    if (shuttingDown) return; // a second signal during teardown must not re-abort/-dispose/-stop
+    shuttingDown = true;
     try {
       await loop.shutdown();
       await mesh.stop();

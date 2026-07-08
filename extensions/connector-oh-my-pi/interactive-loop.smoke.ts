@@ -1,11 +1,12 @@
 /**
- * Behavioral smoke for the cotal-mesh delivery loop (`runPeerLoop` in loop.ts). Repo style: plain
- * assert + console.log, run via `bun loop.smoke.ts`, non-zero exit on failure. No test framework.
+ * Behavioral smoke for the cotal-mesh delivery loop (`runPeerLoop` in interactive-loop.ts). Repo
+ * style: plain assert + console.log, run via `bun interactive-loop.smoke.ts`, non-zero exit on
+ * failure. No test framework.
  *
  * Drives the loop with a structural FakeMesh (captures the on(...) handlers so the test can emit
  * incoming/mention-wake/wake, array-backed peek/drain inbox, controllable attention/channelMode/
  * pendingWake, recording setStatus/stop) and a fake host recording sendMessage. The 8 documented
- * invariants of loop.ts are the spec; each is asserted below.
+ * invariants of interactive-loop.ts are the spec; each is asserted below.
  */
 import { formatInjection, ORIENTATION_BOOTSTRAP, type InboxItem } from "@cotal-ai/connector-core";
 import type { AttentionMode, ChannelMode, PresenceStatus } from "@cotal-ai/core";

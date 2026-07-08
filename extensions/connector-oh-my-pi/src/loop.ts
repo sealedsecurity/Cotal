@@ -122,7 +122,15 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
       return;
     }
     streaming = false;
-    void session.prompt(framed(origin)).catch(onStartError); // wake into a fresh turn
+    // prompt() resolves false when the session DECLINES the wake (no agent_start/agent_end will
+    // follow). Treat that like a pre-flight failure: complete the turn so the peer doesn't wedge
+    // with an in-flight-but-never-streaming origin. A true pre-flight throw routes the same way.
+    session.prompt(framed(origin)).then(
+      (accepted) => {
+        if (!accepted && !streaming) onStartError(new Error("session declined the prompt"));
+      },
+      onStartError,
+    );
   }
 
   /** Fold any front-contiguous, same-scope actionable messages into the live turn (mid-turn
@@ -130,7 +138,12 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
   function foldSameScope(): void {
     if (!turn.origin || !streaming) return;
     for (const item of turn.extend((i, o) => actionable(mesh, i) && scopeKey(i) === scopeKey(o))) {
-      void session.steer(framed(item)).catch(log);
+      // If the steer is rejected the message never reached the model turn — un-surface its id so
+      // the terminal commit() won't ack it. It stays on the stream and redelivers on a later turn.
+      void session.steer(framed(item)).catch((e) => {
+        log(e);
+        turn.unsurface(item.id);
+      });
     }
   }
 
@@ -186,7 +199,7 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
         turn.abandon(); // leave the in-flight run on the stream → redeliver, no peer dropped
         await session.abort();
       }
-      void session.dispose();
+      await session.dispose();
     },
   };
 }
