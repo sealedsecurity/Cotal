@@ -140,6 +140,33 @@ export async function resolveTargetOrExit(flags: {
   return target;
 }
 
+/** Offline sibling of {@link resolveTargetOrExit}: resolve WHICH mesh a command targets from the
+ *  registry alone, with the same one-sentence error render, but WITHOUT connecting or pruning. For
+ *  read-only/offline paths (e.g. `provision-acl --dry-run`) — a raw `--space`/cwd guess would scan a
+ *  different persona set than the real command; resolving through the registry the same way the live
+ *  path does keeps the preview's ROOT/SPACE honest.
+ *
+ *  One deliberate divergence from the live path: `resolveTargetOrExit` calls `pruneStaleMeshes()`
+ *  first (an ONLINE reachability probe that mutates the registry), so on the no-`--space` default it
+ *  can drop a since-dead entry before resolving. This offline preview cannot — probing/mutating would
+ *  break the "offline, side-effect-free" contract — so if a registered mesh has died since it was
+ *  recorded, `--dry-run` may still resolve it where the live run would have pruned it and fallen back.
+ *  Acceptable for a preview (it errs toward showing the recorded target; the live run reconciles). */
+export function resolveTargetNoConnectOrExit(flags: {
+  server?: string;
+  space?: string;
+}): MeshTarget {
+  try {
+    return resolveMeshTarget(process.cwd(), flags);
+  } catch (e) {
+    if (isWorkspaceTargetError(e)) {
+      console.error(c.red(renderWorkspaceError({ kind: "target", error: e })));
+      process.exit(1);
+    }
+    throw e;
+  }
+}
+
 /** Confirm the resolved mesh is up and accepts these creds — replaces the raw NATS "Authorization
  *  Violation" trace with one sentence, and prunes the entry if the broker is gone / mismatched.
  *  The probe + classify + render live in `@cotal-ai/workspace` (shared with the manager control

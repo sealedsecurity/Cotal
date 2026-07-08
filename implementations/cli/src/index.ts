@@ -12,6 +12,7 @@ import { spawn, spawnComplete } from "./commands/spawn.js";
 import { personas, personasComplete } from "./commands/personas.js";
 import { completion, completionComplete, complete } from "./commands/completion.js";
 import { mint } from "./commands/mint.js";
+import { provisionAcl } from "./commands/provision-acl.js";
 import { channels } from "./commands/channels.js";
 import { history } from "./commands/history.js";
 import { feedback } from "./commands/feedback.js";
@@ -146,6 +147,14 @@ const baseCommands: Command[] = [
     summary:
       "mint a creds file for a space (auth mode) — mint <name> --profile <agent|observer> [--out <path>]; --signer emits a stripped account-signing file (no operator key) for a containerized manager",
     run: mint,
+  },
+  {
+    kind: "command",
+    name: "provision-acl",
+    group: "Mesh",
+    summary:
+      "write the durable read-ACL row for every persona-with-creds so the delivery daemon authorizes @mention-wake — provision-acl [--dry-run] [--space <s>]; closes the `cotal mint` + `exec omp` gap",
+    run: provisionAcl,
   },
   {
     kind: "command",

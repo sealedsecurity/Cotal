@@ -241,19 +241,24 @@ export async function spawn(argv: string[]): Promise<void> {
     });
     prov.on("error", (e: Error) => console.error(`! provisioner: ${e.message}`));
     await prov.start();
-    // Direct foreground spawn is LIVE-ONLY: this short-lived provisioner is not a managing Plane-3 host,
-    // and no long-lived manager knows this agent (it's in no manager's `agents` ledger), so a durable
-    // boot membership could be neither authorized for reader delivery nor leaved via self-service. Skip
-    // it — the agent reads live via its core-sub; a durable backstop requires spawning under a manager
-    // (`cotal start` / `cotal up`).
+    // Durable membership is gated on a LIVE delivery daemon, not on being manager-spawned. The durable
+    // reader is the standalone delivery daemon, which re-authorizes every entry from the ACL registry
+    // (not any manager ledger), and self-service leave rides `ctl.delivery.<id>` to that daemon — so a
+    // foreground-spawned agent CAN get a durable backstop as long as a daemon is serving. Probe the
+    // shard-0 delivery lease: present ⇒ provision the ACL row (durable @mention-wake works while the
+    // agent is busy/offline); absent ⇒ no daemon, so stay live-only (an un-authorizable row would just
+    // accrete). The boot self-join's reconcile loop tolerates responder-timing, so lease-present is the
+    // right signal. (`cotal join`'s bare console stays intentionally live-only — it never provisions.)
+    const daemonLive = (await prov.readDeliveryLease(0)) !== undefined;
     const creds = await provisionAgent(prov, auth, identity, {
       subscribe,
       allowSubscribe,
       allowPublish,
       role,
       capabilities: def.capabilities,
-      durableMembership: false,
+      durableMembership: daemonLive,
     });
+    if (daemonLive) console.error(`durable delivery provisioned for ${name} (delivery daemon live)`);
     await prov.stop();
     credsPath = join(authDir(target.root), "creds", `${name}.creds`);
     mkSecretDir(dirname(credsPath)); // harden the creds dir before the cred lands
