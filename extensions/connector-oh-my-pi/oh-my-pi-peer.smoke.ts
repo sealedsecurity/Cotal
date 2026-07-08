@@ -16,6 +16,14 @@ function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(`FAIL: ${msg}`);
 }
 
+/** Drain all pending microtasks (a macrotask tick) so an async prompt/steer callback chain has
+ *  settled before we assert — hop-count-independent, unlike a single `await Promise.resolve()`. */
+const drain = (): Promise<void> => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
 // --- message factories -------------------------------------------------------------------
 function dm(id: string, fromId: string, text = id): InboxItem {
   return { id, ts: 0, fromId, fromName: fromId, kind: "dm", mentionsMe: false, historical: false, text };
@@ -213,6 +221,7 @@ console.log("2) actionable filter OK ✅");
   assert(session.steers.length === 1 && session.steers[0] === framed(dm("a2", "alice", "q2")),
     "same-scope peer folded via steer; cross-scope not folded");
   assert(mesh.items.some((x) => x.id === "b1"), "cross-scope message stays on the stream");
+  await Promise.resolve(); // let the folded steer's .then (pendingSteerIds.delete) confirm before commit
   session.emit(end("ans")); // terminal → commit alice run, deliver, pump next scope
   assert(ids(mesh.acked) === "a1,a2", "the surfaced same-scope run [a1,a2] was acked on end");
   assert(mesh.dms.length === 1 && mesh.dms[0].target === "alice", "one reply delivered to the shared scope");
@@ -299,12 +308,12 @@ console.log("6) agent_end terminal without willRetry OK ✅");
   mesh.items = [dm("d1", "alice", "q")];
   session.promptResult = false; // the session declines the wake
   runPeerLoop({ mesh, session }); // pump fires → prompt called → resolves false, no START emitted
-  await Promise.resolve(); // let the prompt().then handler run on its microtask
+  await drain(); // let the async prompt().then chain settle (2 hops) before asserting
   assert(session.prompts.length === 1, "the declined origin was prompted exactly once");
   assert(ids(mesh.acked) === "d1", "declined origin committed (acked, drop/no-retry) — not wedged");
   assert(last(mesh.statuses).status === "idle", "the peer went idle after the decline");
   mesh.arrive(dm("d2", "bob", "q2")); // a fresh message must pump — the peer is not wedged
-  await Promise.resolve();
+  await drain();
   assert(session.prompts[1] === framed(dm("d2", "bob", "q2")), "a fresh turn pumped after the decline");
 }
 console.log("7) declined prompt completes the turn (no wedge) OK ✅");
@@ -321,7 +330,7 @@ console.log("7) declined prompt completes the turn (no wedge) OK ✅");
   runPeerLoop({ mesh, session });
   session.emit(START); // turn live, streaming
   mesh.arrive(dm("a2", "alice", "q2")); // same scope → foldSameScope → extend surfaces a2, steer rejects
-  await Promise.resolve(); // let the steer().catch → turn.unsurface(a2) run
+  await drain(); // let the steer().catch → turn.unsurface(a2) run
   session.emit(end("ans")); // terminal → commit acks the surfaced run
   assert(ids(mesh.acked) === "a1", "only the delivered origin a1 acked; the rejected fold a2 is not");
   assert(mesh.items.some((x) => x.id === "a2"), "a2 stays on the stream (redelivers, not lost)");
