@@ -30,8 +30,8 @@ But the two launch paths agents actually use never reach that write:
    const creds = await mintCreds(auth, identity, profile, { allowSubscribe, allowPublish, role });
    ```
 
-   mint is purely offline: it has no `CotalEndpoint`/`connect`/`isReachable` code at all (verified by
-   search over `mint.ts` this session — zero matches), so it cannot write a KV row.
+   mint is purely offline: it has no `CotalEndpoint`/`connect`/`isReachable` code at all (a search over
+   `mint.ts` for those symbols returns zero matches), so it cannot write a KV row.
 
 2. **`cotal spawn`** explicitly opts out — `implementations/cli/src/commands/spawn.ts:249-256`:
 
@@ -51,7 +51,7 @@ if (acl === undefined)
   return { ok: false, error: `durableJoin: no read ACL on record for ${caller} (not provisioned for durable delivery)` };
 ```
 
-**Live evidence (this session, from the investigation brief):** the live `cotal_acl_main` bucket held
+**Live evidence (from the investigation record that motivated this design):** the live `cotal_acl_main` bucket held
 **0 rows across all 7 connected agents** — every dormant agent was wake-blind. An out-of-band
 backfill (`commitAcl` per live agent id) took rows 0→6, after which durable memberships self-healed
 0→8 with no reconnect via the boot-join reconcile loop (`endpoint.ts:1938-1942`, capped-backoff
