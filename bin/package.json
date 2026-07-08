@@ -34,6 +34,7 @@
     "@cotal-ai/cli": "workspace:*",
     "@cotal-ai/cmux": "workspace:*",
     "@cotal-ai/tmux": "workspace:*",
+    "@cotal-ai/zellij": "workspace:*",
     "@cotal-ai/connector-claude-code": "workspace:*",
     "@cotal-ai/connector-hermes": "workspace:*",
     "@cotal-ai/connector-opencode": "workspace:*",

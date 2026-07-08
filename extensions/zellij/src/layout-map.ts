@@ -61,6 +61,8 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
   let depth = 0; // brace depth relative to the tab body; panes live at the tab's direct child level
   let inSwapOrTemplate = false;
   let swapDepth = 0;
+  let inPluginPane = false; // inside a `pane size=1 borderless=true { plugin … }` UI frame — skip wholesale
+  let pluginDepth = 0;
 
   for (const raw of lines) {
     const line = raw.trim();
@@ -73,6 +75,20 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
     if (inSwapOrTemplate) {
       swapDepth += countBraces(line);
       if (swapDepth <= 0 && /\}/.test(line)) inSwapOrTemplate = false;
+      continue;
+    }
+
+    // Skip plugin/UI frame panes wholesale — `pane size=1 borderless=true { plugin location="…" }`
+    // (tab-/status-bar). They hold no agent content, so their children (a stray `cwd`/`args`) must
+    // never leak onto the last real pane. Keyed on size/borderless — NOT `stacked=true`, whose
+    // children ARE content.
+    if (/^pane\b[^{]*\b(?:size|borderless)=/.test(line) && /\{/.test(line)) {
+      inPluginPane = true;
+      pluginDepth = 0;
+    }
+    if (inPluginPane) {
+      pluginDepth += countBraces(line);
+      if (pluginDepth <= 0 && /\}/.test(line)) inPluginPane = false;
       continue;
     }
 

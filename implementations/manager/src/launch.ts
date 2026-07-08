@@ -49,6 +49,12 @@ const LaunchAgentSchema = z.strictObject({
       floating: z.boolean().optional(),
       direction: z.enum(["right", "down"]).optional(),
     })
+    // Shape is mutually exclusive: the zellij driver resolves stacked > floating > direction, so a
+    // combo like {stacked, floating} would silently drop one. Reject >1 set rather than pick quietly.
+    .refine(
+      (p) => [p.stacked === true, p.floating === true, p.direction !== undefined].filter(Boolean).length <= 1,
+      { message: "placement shape is exclusive: set at most one of stacked, floating, direction" },
+    )
     .optional(),
   hash: z.string().regex(/^[A-Za-z0-9]+$/, "hash must be alphanumeric"),
 });

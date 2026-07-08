@@ -117,6 +117,32 @@ console.log("\n── layout-map (pure) ─────────────�
   ok("seedFromDump parses inline cwd= on the pane line", rp?.cwd === "agents/workspaces/zheng");
   ok("seedFromDump parses the args child node", rp?.args?.length === 1 && rp.args[0] === "--resume");
   ok("seedFromDump ignores start_suspended", rp?.command === "omp" && real.tabs[0]?.panes.length === 1);
+  // A plugin/UI frame pane (`pane size=1 borderless=true { plugin … }`) holds no agent content; a
+  // stray `cwd`/`args` child inside it must NOT leak onto the last real pane (regression: the child
+  // matchers once fired unguarded across the skipped block).
+  const withPlugin = [
+    'layout {',
+    '    tab name="w" {',
+    '        pane command="omp" {',
+    '            args "--resume"',
+    '        }',
+    '        pane size=1 borderless=true {',
+    '            plugin location="zellij:status-bar"',
+    '            cwd "/WRONG/leaked"',
+    '            args "leaked"',
+    '        }',
+    '    }',
+    '}',
+  ].join("\n");
+  const wp = seedFromDump(withPlugin);
+  const wpPane = wp.tabs[0]?.panes[0];
+  ok(
+    "seedFromDump skips plugin frames (no cwd/args leak onto real panes)",
+    wp.tabs[0]?.panes.length === 1 &&
+      wpPane?.cwd === undefined &&
+      wpPane?.args?.length === 1 &&
+      wpPane.args[0] === "--resume",
+  );
   // Malformed input degrades to an empty map (best-effort seed, never throws).
   ok("seedFromDump tolerates junk", seedFromDump("not a layout").tabs.length === 0);
 }
@@ -127,6 +153,11 @@ if (!zellij.available()) {
   console.log("zellij not installed — skipping @cotal-ai/zellij smoke.");
   process.exit(0);
 }
+
+// Guarantee teardown on ANY exit — normal, `process.exit(1)` on failure, or an uncaught throw
+// mid-body (the header's "cleans up on pass or fail" promise). Registered before the first live
+// session is created; `cleanup` is sync + idempotent, so a later explicit call would only no-op.
+process.on("exit", cleanup);
 
 cleanup(); // start fresh
 

@@ -154,6 +154,38 @@ channels:
     allowPublish: [a]
 `, "Unrecognized key");
 
+// placement shape is exclusive: >1 of stacked/floating/direction → rejected.
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement:
+      tab: t
+      stacked: true
+      floating: true
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "exclusive");
+
+// placement.tab starting with '-' (flag-injection) → rejected (mirrors the launch-boundary guard).
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement:
+      tab: "-rf"
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "control chars");
+
 // unknown runtime value → rejected (enum lock).
 fails(`${HEAD}
 runtime: screen
@@ -165,7 +197,7 @@ channels:
   general:
     subscribe: [a]
     allowPublish: [a]
-`, "");
+`, "Invalid option");
 
 // --- per-agent personaPermissions override -----------------------------------------------------
 {

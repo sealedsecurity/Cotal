@@ -33,11 +33,23 @@ const AgentEntryObject = z
      *  reads it; other runtimes accept-and-ignore, so the manifest stays valid under any backend. */
     placement: z
       .strictObject({
-        tab: z.string().min(1).optional(),
+        tab: z
+          .string()
+          .min(1)
+          .refine((s) => !s.startsWith("-") && !/[\x00-\x1f]/.test(s), {
+            message: "placement.tab must not start with '-' and have no control chars",
+          })
+          .optional(),
         stacked: z.boolean().optional(),
         floating: z.boolean().optional(),
         direction: z.enum(["right", "down"]).optional(),
       })
+      // Shape is mutually exclusive (the zellij driver resolves stacked > floating > direction);
+      // reject >1 set at manifest-load rather than silently drop one at launch.
+      .refine(
+        (p) => [p.stacked === true, p.floating === true, p.direction !== undefined].filter(Boolean).length <= 1,
+        { message: "placement shape is exclusive: set at most one of stacked, floating, direction" },
+      )
       .optional(),
   })
   .refine((v) => v.persona !== undefined || v.model !== undefined || v.variant !== undefined || v.instructions !== undefined, {
