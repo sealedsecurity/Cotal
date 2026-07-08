@@ -107,10 +107,15 @@ export interface AclProvisionResult {
 }
 
 /**
- * Provision (commit) an ACL row for every persona that already has creds. A credless persona is
- * SKIPPED (an ACL row is keyed by agent id, which exists only once creds are minted) — this command
- * never mints: minting is `cotal mint`'s job, and mint-if-absent is the still-open mint-strategy fork.
- * A drift entry (creds read scope != file ACL) is fail-loud skipped, never silently rewritten.
+ * Provision the durable-delivery footprint for every persona that already has creds: the bind-only
+ * `dm_<id>` + `dlv_<id>` mailboxes (which the agent cannot self-create — it's denied CONSUMER.CREATE
+ * on those streams) AND the read-ACL row. All three are what `provisionAgent` writes for a spawned
+ * agent; a `cotal mint` + `exec omp` agent gets none of them, so committing only the ACL row would
+ * authorize the owner while its @mention-wake messages pile undrained in an absent `dlv_<id>`. A
+ * credless persona is SKIPPED (the id — hence every server-side object — exists only once creds are
+ * minted); this command never mints (that's `cotal mint`'s job, and mint-if-absent is the still-open
+ * mint-strategy fork). A drift entry (creds read scope != file ACL) is fail-loud skipped, never
+ * silently rewritten. Every write is idempotent, so the command is re-runnable.
  */
 export async function provisionAcls(opts: {
   root: string;
@@ -147,14 +152,24 @@ export async function provisionAcls(opts: {
         result.skipped.push({ name: e.name, reason: "no creds (run `cotal mint` first)" });
         continue;
       }
-      const id = e.id;
-      await ep.commitAcl(id as string, e.allowSubscribe);
+      const id = e.id as string;
+      // Provision the FULL durable-delivery footprint, not just the ACL row. @mention-wake delivery
+      // rides the daemon's fan-out → per-member `dlv_<id>` DELIVER durable; the agent binds+pumps it
+      // but is DENIED CONSUMER.CREATE on DLV (only a provisioner may create it — see provision.ts), and
+      // `pumpDlv` silently no-ops when it's absent. A `cotal mint` + `exec omp` agent (this command's
+      // target) has NEITHER the ACL row NOR the dm/dlv durables — so writing only the ACL row would
+      // authorize the owner while its wake messages pile undrained. Mirror provisionAgent's footprint:
+      // pre-create the bind-only dm+dlv mailboxes (both idempotent — re-runnable, existing durables
+      // untouched), then record the ACL row.
+      await ep.provisionDmInbox(id);
+      await ep.provisionDlvInbox(id);
+      await ep.commitAcl(id, e.allowSubscribe);
       // Read-back through the public accessor confirms the row landed (and is what the daemon's reader
       // will see) — a real verification, not just a key tally.
-      const back = await ep.aclForOwner(id as string);
+      const back = await ep.aclForOwner(id);
       if (JSON.stringify([...(back ?? [])].sort()) !== JSON.stringify([...e.allowSubscribe].sort()))
         throw new Error(`ACL write for ${e.name} did not read back: wrote ${JSON.stringify(e.allowSubscribe)}, read ${JSON.stringify(back)}`);
-      result.provisioned.push({ name: e.name, id: id as string, allowSubscribe: e.allowSubscribe });
+      result.provisioned.push({ name: e.name, id, allowSubscribe: e.allowSubscribe });
     }
     result.rowCount = result.provisioned.length;
   } finally {
