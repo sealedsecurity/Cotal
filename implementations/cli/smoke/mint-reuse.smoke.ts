@@ -116,14 +116,27 @@ try {
   // 6) A present-but-unparseable creds file at the out path fails LOUD naming --force — never a raw
   //    parse crash, and never a silent fresh-mint (which would orphan the predecessor id's durables).
   mkdirSync(credsDir, { recursive: true });
-  writeFileSync(join(credsDir, "corrupt.creds"), ""); // present but no seed block
+  const corruptCreds = join(credsDir, "corrupt.creds");
+  writeFileSync(corruptCreds, ""); // present but no seed block
   let msg = "";
   try {
     await mintQuiet(["corrupt"]);
   } catch (e) {
     msg = e instanceof Error ? e.message : String(e);
   }
-  check("unparseable existing creds → actionable error naming --force (no silent rotate, no raw crash)", /could not be parsed/.test(msg) && /--force/.test(msg), { msg });
+  check(
+    "unparseable existing creds → actionable error naming --force (no silent rotate, no raw crash)",
+    /could not be parsed/.test(msg) && /--force/.test(msg),
+    { msg },
+  );
+  // Assert the FILESYSTEM state, not just the message: the failed mint must not have written fresh
+  // creds over the corrupt file. A future refactor that mints-then-throws would still surface a
+  // parse error yet silently rotate the id — this catches that by proving the file is untouched.
+  check(
+    "failed corrupt-creds mint left the file untouched (no silent fresh-mint)",
+    readFileSync(corruptCreds, "utf8") === "",
+    { content: readFileSync(corruptCreds, "utf8").slice(0, 40) },
+  );
 } finally {
   process.chdir(prevCwd);
   rmSync(root, { recursive: true, force: true });
