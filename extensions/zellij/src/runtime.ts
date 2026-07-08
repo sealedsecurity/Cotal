@@ -91,7 +91,7 @@ export class ZellijRuntime implements Runtime {
     return {
       name,
       kind: "zellij",
-      status: () => (zellij.tabNames(this.session).includes(name) ? "running" : "exited"),
+      status: () => (zellij.tabExists(this.session, tabId) ? "running" : "exited"),
       stop: (opts) => {
         if (opts?.graceful === false) return zellij.closeTabById(this.session, tabId);
         // Graceful: focus the tab, type `/exit` so the session shuts down cleanly (its SessionEnd
@@ -141,6 +141,9 @@ export class ZellijRuntime implements Runtime {
     confirm: string | undefined,
   ): AgentHandle {
     const tab = placement.tab as string;
+    // Placement pane-id ops need an attached client (a client-less background session silently
+    // no-ops `new-pane`, so the pane reads as exited). Ensure one before splitting the tab.
+    zellij.ensureClient(this.session);
     // Focus (creating on demand) the target tab so the new pane lands inside it.
     zellij.goToTabNameCreate(this.session, tab);
     const paneId = zellij.newPane(this.session, argv, cwd, {
@@ -218,15 +221,23 @@ function zellijLayout(session: string, label: string, tab: Tab): string {
   // Focus the new tab so the subsequent new-pane splits land inside it.
   const tabId = zellij.openTab(session, label, firstArgv, first.cwd ?? ".", { focus: true });
 
-  if (first.confirm) scheduleConfirm(session, label);
+  // Confirm is PANE-scoped, not tab-scoped: a tab-focus Enter only reaches the tab's currently-
+  // focused pane, so with several panes the later splits steal focus and the earlier panes' prompts
+  // never clear. `openTab` prints only a tab id, so resolve the first pane's id from focus; fall back
+  // to a tab-scoped confirm if it isn't resolvable (e.g. no client yet).
+  if (first.confirm) {
+    const firstPane = zellij.focusedPaneId(session);
+    if (firstPane) scheduleConfirmPane(session, firstPane);
+    else scheduleConfirm(session, label);
+  }
 
   // {@link Tab.split.direction} convention: "horizontal" → stacked top/bottom rows (zellij "down");
   // "vertical" → side-by-side columns (zellij "right").
   const direction = tab.split?.direction === "vertical" ? "right" : "down";
   rest.forEach((pane) => {
     const argv = zellij.mergedArgv(pane.env ?? {}, pane.command, pane.args ?? []);
-    zellij.newPane(session, argv, pane.cwd ?? ".", { direction });
-    if (pane.confirm) scheduleConfirm(session, label);
+    const paneId = zellij.newPane(session, argv, pane.cwd ?? ".", { direction });
+    if (pane.confirm) scheduleConfirmPane(session, paneId);
   });
 
   return tabId;

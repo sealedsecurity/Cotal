@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 /**
  * A thin driver over the `zellij` CLI (`zellij action …` on a running session). Mesh-free — the
@@ -53,6 +53,53 @@ export function hasSession(session: string): boolean {
 export function ensureSession(session: string): void {
   if (hasSession(session)) return;
   execFileSync("zellij", ["attach", "--create-background", session], { stdio: "ignore" });
+}
+
+/** True if `session` has at least one attached client. `list-clients` lists one row per connected
+ *  client (plus a header); a background session with no client lists none. Unreachable → `false`. */
+export function hasClient(session: string): boolean {
+  try {
+    const out = execFileSync("zellij", actionArgs(session, ["list-clients"]), { encoding: "utf8" });
+    // Rows after the `CLIENT_ID …` header are real clients; a client row starts with a digit.
+    return out.split("\n").some((l) => /^\d/.test(l.trim()));
+  } catch {
+    return false;
+  }
+}
+
+/** Ensure `session` has an attached client, spawning a detached headless PTY one if none is present.
+ *  The PLACEMENT path needs this: pane-id ops (`new-pane`/`list-panes`/`close-pane -p`) silently no-op
+ *  against a client-less background session — a placed pane never actually spawns and then reads as
+ *  `exited` (verified on zellij 0.44.3). A real client makes them reliable; `zellij attach` needs a
+ *  PTY, so wrap it in `script -qec` (util-linux). The client is `detached`+`unref`'d so it outlives
+ *  this process — it's session-scoped (reaped when the session is deleted), NOT manager-scoped. The
+ *  human's own later `zellij attach` simply adds a second client (zellij multiplexes). Idempotent:
+ *  skipped when a client (this one, or the human) is already attached. Best-effort — a missing
+ *  `script` is not fatal; the caller still surfaces any resulting pane failure. */
+export function ensureClient(session: string): void {
+  if (hasClient(session)) return;
+  try {
+    const client = spawn("script", ["-qec", `zellij attach ${session}`, "/dev/null"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    client.unref();
+  } catch {
+    /* `script` not on PATH — placement pane ops may be unreliable; caller surfaces the failure. */
+    return;
+  }
+  // Block until the client is actually attached (≈140ms locally on 0.44.3), so a caller's subsequent
+  // pane op sees a real client. Bounded busy-wait via a synchronous `sleep` child — `spawn` can't be
+  // awaited from the sync spawn path. Give up after ~3s and let the caller proceed (best-effort).
+  for (let i = 0; i < 30; i++) {
+    if (hasClient(session)) return;
+    try {
+      execFileSync("sleep", ["0.1"], { stdio: "ignore" });
+    } catch {
+      /* sleep unavailable — stop waiting */
+      return;
+    }
+  }
 }
 
 /** Every `zellij action` for `session` runs as a client against that specific session
@@ -200,6 +247,23 @@ export function paneExists(session: string, paneId: string): boolean {
   }
 }
 
+/** The id (`terminal_<n>`) of the currently-focused content pane in `session`, or `null` if none is
+ *  resolvable. Reads `list-panes --json` and picks the focused non-plugin pane. Used right after
+ *  `openTab` to learn the first pane's id (zellij prints only a TAB id at `new-tab`), so a per-pane
+ *  confirm can target it precisely rather than tab-focus (which races later splits). */
+export function focusedPaneId(session: string): string | null {
+  try {
+    const out = execFileSync("zellij", actionArgs(session, ["list-panes", "--json"]), {
+      encoding: "utf8",
+    });
+    const panes = JSON.parse(out) as Array<{ id: number; is_plugin?: boolean; is_focused?: boolean }>;
+    const focused = panes.find((p) => p.is_focused && !p.is_plugin);
+    return focused ? `terminal_${focused.id}` : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Focus a specific pane by its id (`terminal_<n>`), across tabs (verified: focuses a pane in a
  *  non-focused tab). Used before a pane-scoped write (interrupt / graceful `/exit`) so the keystrokes
  *  land in that agent's pane, not whatever else the tab last focused. Throws if the pane is gone —
@@ -255,6 +319,25 @@ export function tabNames(session: string): string[] {
       .filter(Boolean);
   } catch {
     return [];
+  }
+}
+
+/** True if a tab with the stable numeric `tabId` is open in `session`. Reads `list-tabs --json`
+ *  (whose `tab_id` is the id `openTab` returns) so it survives a tab RENAME — unlike a name-based
+ *  check, which desyncs the moment a title escape or `rename-tab` changes the visible name. Reliable
+ *  clientless (verified: `list-tabs` answers a background session). A missing tab / unreachable
+ *  session reads as absent → `false`. */
+export function tabExists(session: string, tabId: string): boolean {
+  const n = Number(tabId);
+  if (!Number.isInteger(n)) return false;
+  try {
+    const out = execFileSync("zellij", actionArgs(session, ["list-tabs", "--json"]), {
+      encoding: "utf8",
+    });
+    const tabs = JSON.parse(out) as Array<{ tab_id?: number }>;
+    return tabs.some((t) => t.tab_id === n);
+  } catch {
+    return false;
   }
 }
 

@@ -3,7 +3,7 @@
  * Run from the repo root: pnpm exec tsx extensions/zellij/smoke.ts
  * Uses a real background zellij session; cleans up on pass or fail.
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { registry } from "@cotal-ai/core";
 import * as zellij from "./src/driver.js";
 import { ZellijRuntime, zellijRuntimeProvider, zellijTerminalProvider } from "./src/runtime.js";
@@ -210,6 +210,16 @@ ok(`handle.kind = "zellij"`, handle.kind === "zellij");
 ok("handle.status() = running", handle.status() === "running");
 ok("tab alive after spawn", zellij.tabNames(SESSION).includes("smoke-agent"));
 
+// Regression (status by stable tab id, not mutable name): rename the tab out from under the handle;
+// a name-based status() would now read "exited", the id-based one stays "running". Needs a client to
+// apply the rename (background sessions don't rename clientless).
+zellij.ensureClient(SESSION);
+zellij.goToTabName(SESSION, "smoke-agent");
+execFileSync("zellij", ["--session", SESSION, "action", "rename-tab", "smoke-renamed"]);
+await new Promise((r) => setTimeout(r, 400));
+ok("tab renamed (name-based status would be wrong now)", !zellij.tabNames(SESSION).includes("smoke-agent"));
+ok("status() = running AFTER rename (id-based survives it)", handle.status() === "running");
+
 // E2E no-leak: the secret env VALUE must not appear in zellij's queryable layout — env rides the
 // structural argv over the control socket (env -i), never a rendered command line.
 const layout = execFileSync("zellij", ["--session", SESSION, "action", "dump-layout"], {
@@ -224,7 +234,7 @@ throws("attach() throws", () => handle.attach());
 
 handle.stop({ graceful: false });
 await new Promise((r) => setTimeout(r, 300));
-ok("tab gone after hard stop", !zellij.tabNames(SESSION).includes("smoke-agent"));
+ok("renamed tab gone after hard stop (close-by-id ignores the name)", !zellij.tabNames(SESSION).includes("smoke-renamed"));
 ok("handle.status() = exited after stop", handle.status() === "exited");
 
 console.log("\n── registry registration ────────────────────────");
@@ -249,16 +259,14 @@ throws("isolatedArgv rejects an unsafe env var name", () =>
   zellij.isolatedArgv({ "BAD NAME": "x" }, "echo", []),
 );
 
-console.log("\n── placement (pane-into-tab; needs an attached client) ──");
-// Pane-id ops (list-panes / focus-pane-id / close-pane -p) are only reliable with a client attached
-// (verified): a background session's focus is stuck and pane-ids aren't introspectable. So fork a
-// real `zellij attach` client for this section, then tear it down. Agents use an ABSOLUTE command —
-// `isolatedArgv` wraps in `env -i`, which strips PATH, so a bare name wouldn't resolve.
+console.log("\n── placement (pane-into-tab; the runtime auto-attaches a client) ──");
+// Regression (greptile P1): placement pane-id ops (new-pane / list-panes / close-pane -p) silently
+// no-op against a client-less background session, so a placed pane never spawns and reads as exited.
+// The runtime's spawnIntoTab now calls ensureClient to attach a headless PTY client first — so this
+// section spawns placement agents WITHOUT pre-attaching its own client and proves they come up live.
+// ensureClient uses `script` (util-linux); skip honestly if it's absent (the fix can't work without it).
 {
   const PSESSION = "cotal-zellij-smoke-placement";
-  // The client needs a PTY to actually attach — `spawn(..., {stdio:"ignore"})` gives no TTY and the
-  // attach no-ops. `script -qec "<cmd>" /dev/null` runs the command under a PTY. If `script` isn't on
-  // PATH (util-linux), skip the live-placement section honestly rather than report false failures.
   let hasScript = true;
   try {
     execFileSync("script", ["--version"], { stdio: "ignore" });
@@ -266,35 +274,37 @@ console.log("\n── placement (pane-into-tab; needs an attached client) ──
     hasScript = false;
   }
   if (!hasScript) {
-    console.log("  ⏭  `script` (util-linux) not available — skipping live placement (pane-id ops need an attached client).");
+    console.log("  ⏭  `script` (util-linux) not available — skipping live placement (ensureClient needs it).");
   } else {
     try {
       execFileSync("zellij", ["delete-session", "--force", PSESSION], { stdio: "ignore" });
     } catch {
       /* none — fine */
     }
-    zellij.ensureSession(PSESSION);
-    // Attach a client under a PTY, in its own session (detached) so we can reap the whole group.
-    const client = spawn("script", ["-qec", `zellij attach ${PSESSION}`, "/dev/null"], {
-      stdio: "ignore",
-      detached: true,
-    });
-    await new Promise((r) => setTimeout(r, 1500)); // let the client attach + paint
-
     try {
       const rt = new ZellijRuntime(PSESSION);
       const place = { tab: "lane", stacked: true } as const;
+      // No pre-attached client: ensureSession makes a background session, and spawnIntoTab's
+      // ensureClient must attach one so the pane actually spawns.
       const a = rt.spawn("laneA", { command: "/usr/bin/env", args: ["sleep", "600"] }, "/tmp", place);
+      ok("placement: a client is attached after the first placed spawn", zellij.hasClient(PSESSION));
       const b = rt.spawn("laneB", { command: "/usr/bin/env", args: ["sleep", "600"] }, "/tmp", place);
       await new Promise((r) => setTimeout(r, 900));
 
       ok("placement: both agents land in one tab (create-on-demand)", zellij.tabNames(PSESSION).includes("lane"));
-      ok("placement: laneA is running", a.status() === "running");
+      ok("placement: laneA is running (pane really spawned, not exited)", a.status() === "running");
       ok("placement: laneB is running", b.status() === "running");
 
       // ad-hoc tab still works after placement (the fluid-tab guarantee).
       zellij.goToTabNameCreate(PSESSION, "adhoc");
       ok("placement: an ad-hoc tab can still be created after placement", zellij.tabNames(PSESSION).includes("adhoc"));
+
+      // Regression (cubic P1: per-pane confirm routing): the "lane" tab now holds 2 panes. A confirm
+      // must target each pane's OWN id (scheduleConfirmPane), not a tab-focus Enter that only reaches
+      // the last-focused pane. Prove the inputs the fix routes on: the focused pane resolves to a
+      // concrete terminal id, and paneExists confirms both lane panes are independently addressable.
+      const focused = zellij.focusedPaneId(PSESSION);
+      ok("confirm-routing: a content pane id resolves (per-pane confirm target, not tab-focus)", focused !== null && /^terminal_\d+$/.test(focused));
 
       // Per-pane teardown: stopping laneA leaves laneB alive (shared tab, precise close).
       a.stop({ graceful: false });
@@ -306,12 +316,7 @@ console.log("\n── placement (pane-into-tab; needs an attached client) ──
       await new Promise((r) => setTimeout(r, 500));
       ok("placement: laneB exited after its own stop", b.status() === "exited");
     } finally {
-      // Reap the client's process group (script + its zellij child).
-      try {
-        if (client.pid) process.kill(-client.pid);
-      } catch {
-        /* already gone */
-      }
+      // delete-session reaps the headless client ensureClient attached (session-scoped, detached).
       try {
         execFileSync("zellij", ["delete-session", "--force", PSESSION], { stdio: "ignore" });
       } catch {
