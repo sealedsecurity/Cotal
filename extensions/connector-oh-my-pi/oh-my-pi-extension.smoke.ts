@@ -10,6 +10,7 @@
 import cotalMesh from "./src/extension.ts";
 import * as zodV4 from "zod/v4";
 import { MeshAgent } from "@cotal-ai/connector-core";
+import { setImmediate as settle } from "node:timers/promises";
 
 function assert(cond: unknown, msg: string): asserts cond {
 	if (!cond) {
@@ -144,6 +145,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			const sessionStart = events.get("session_start") as SessionStart;
 			startCalls = 0;
 			await sessionStart(undefined, { hasUI: true, sessionManager: { getSessionName: () => undefined } });
+			await settle(); // the title work is now a detached fire-and-forget IIFE — let it settle before asserting sessionNameSets
 			assert(startCalls === 1, "hasUI:true → agent.start invoked (interactive session joins)");
 			assert(
 				sessionNameSets.length === 1 && sessionNameSets[0] === "smoke-peer",
@@ -159,6 +161,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			const sessionStart = events.get("session_start") as SessionStart;
 			startCalls = 0;
 			await sessionStart(undefined, { hasUI: true, sessionManager: { getSessionName: () => "user-renamed" } });
+			await settle(); // detached title IIFE: flush the microtask queue before asserting the (suppressed) rename
 			assert(sessionNameSets.length === 0, "hasUI:true + already named → setSessionName NEVER called (guard protects /rename + resume)");
 			assert(startCalls === 1, "hasUI:true + already named → agent.start still invoked (join unaffected by the guard)");
 		}
@@ -171,8 +174,37 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			const sessionStart = events.get("session_start") as SessionStart;
 			startCalls = 0;
 			await sessionStart(undefined, { hasUI: true, sessionManager: { getSessionName: () => undefined } });
+			await settle(); // detached title IIFE: flush before asserting the attempted-then-swallowed rename
 			assert(sessionNameSets.length === 1 && sessionNameSets[0] === "smoke-peer", "setSessionName rejects → rename attempted exactly once");
 			assert(startCalls === 1, "setSessionName rejects → agent.start still invoked (best-effort: title failure never breaks the join)");
+		}
+		// (e) P1 regression: getSessionName() THROWS (session manager not ready). The cosmetic rename
+		//     must NEVER gate the mesh-join. With the fix, agent.start() fires FIRST and the guard read
+		//     lives INSIDE the detached IIFE's try, so the throw is swallowed there and can't reach the
+		//     handler — the join proceeds regardless (this is the exact both-bots P1: a not-ready
+		//     session manager once left the pane off the mesh).
+		{
+			const { pi, events, sessionNameSets } = fakePi();
+			cotalMesh(pi as never);
+			const sessionStart = events.get("session_start") as SessionStart;
+			startCalls = 0;
+			let handlerThrew = false;
+			try {
+				await sessionStart(undefined, {
+					hasUI: true,
+					sessionManager: {
+						getSessionName: () => {
+							throw new Error("session manager not ready");
+						},
+					},
+				});
+			} catch {
+				handlerThrew = true;
+			}
+			await settle(); // let the detached IIFE run (its try/catch swallows the getSessionName throw)
+			assert(!handlerThrew, "getSessionName throws → session_start still resolves (throw confined to the detached IIFE)");
+			assert(startCalls === 1, "getSessionName throws → agent.start STILL invoked (the crux: a not-ready session manager never gates the join)");
+			assert(sessionNameSets.length === 0, "getSessionName throws → setSessionName NEVER called (the guard read threw before any rename)");
 		}
 	} finally {
 		MeshAgent.prototype.start = origStart;
