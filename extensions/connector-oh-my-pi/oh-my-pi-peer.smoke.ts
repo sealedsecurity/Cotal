@@ -120,6 +120,12 @@ class StubSession implements PeerSession {
   steers: string[] = [];
   aborted = 0;
   disposed = 0;
+  /** Opt-in: value `prompt()` resolves to. Default `true` (session accepts the wake). Set
+   *  `false` to simulate a DECLINED wake (no agent_start/agent_end follows). */
+  promptResult = true;
+  /** Opt-in: when `true`, `steer()` records then REJECTS (the fold couldn't reach the model
+   *  turn). Default `false` (records + resolves as before). */
+  steerReject = false;
   private listeners: ((event: AgentSessionEvent) => void)[] = [];
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {
@@ -131,10 +137,14 @@ class StubSession implements PeerSession {
   }
   async prompt(text: string): Promise<boolean> {
     this.prompts.push(text);
-    return true;
+    return this.promptResult;
   }
-  async steer(text: string): Promise<void> {
+  steer(text: string): Promise<void> {
     this.steers.push(text);
+    // A non-async return so a rejected steer settles in ONE microtask (an `async` method would
+    // adopt the thenable and take extra ticks) — the loop's `.catch → unsurface` then runs after
+    // a single `await Promise.resolve()`, matching how the real session rejects.
+    return this.steerReject ? Promise.reject(new Error("steer rejected")) : Promise.resolve();
   }
   async abort(): Promise<void> {
     this.aborted++;
@@ -278,5 +288,45 @@ console.log("5) presence mapping OK ✅");
   assert(ids(mesh.acked) === "a1,b1" && mesh.dms.length === 2, "the pumped bob turn also commits + delivers");
 }
 console.log("6) agent_end terminal without willRetry OK ✅");
+
+// 7) declined prompt completes the turn (no wedge): prompt() resolving false means the session
+//    DECLINED the wake — no agent_start/agent_end follows. The turn must still complete (ack the
+//    origin, go idle) and the NEXT message must pump; pre-fix the origin was never acked and the
+//    peer wedged with an in-flight-but-never-streaming turn.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("d1", "alice", "q")];
+  session.promptResult = false; // the session declines the wake
+  runPeerLoop({ mesh, session }); // pump fires → prompt called → resolves false, no START emitted
+  await Promise.resolve(); // let the prompt().then handler run on its microtask
+  assert(session.prompts.length === 1, "the declined origin was prompted exactly once");
+  assert(ids(mesh.acked) === "d1", "declined origin committed (acked, drop/no-retry) — not wedged");
+  assert(last(mesh.statuses).status === "idle", "the peer went idle after the decline");
+  mesh.arrive(dm("d2", "bob", "q2")); // a fresh message must pump — the peer is not wedged
+  await Promise.resolve();
+  assert(session.prompts[1] === framed(dm("d2", "bob", "q2")), "a fresh turn pumped after the decline");
+}
+console.log("7) declined prompt completes the turn (no wedge) OK ✅");
+
+// 8) rejected steer un-surfaces its message (redelivers, not lost): a folded same-scope message
+//    is surfaced then steered; if steer() REJECTS the message never reached the model turn, so the
+//    terminal commit must NOT ack it — it stays on the stream and redelivers. Pre-fix commit acked
+//    the undelivered fold (acked === "a1,a2") and the message was lost from the stream.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("a1", "alice", "q1")];
+  session.steerReject = true; // the fold's steer will reject (never reaches the model turn)
+  runPeerLoop({ mesh, session });
+  session.emit(START); // turn live, streaming
+  mesh.arrive(dm("a2", "alice", "q2")); // same scope → foldSameScope → extend surfaces a2, steer rejects
+  await Promise.resolve(); // let the steer().catch → turn.unsurface(a2) run
+  session.emit(end("ans")); // terminal → commit acks the surfaced run
+  assert(ids(mesh.acked) === "a1", "only the delivered origin a1 acked; the rejected fold a2 is not");
+  assert(mesh.items.some((x) => x.id === "a2"), "a2 stays on the stream (redelivers, not lost)");
+  assert(session.steers.length === 1, "the fold attempted the steer exactly once");
+}
+console.log("8) rejected steer un-surfaces its message (redelivers) OK ✅");
 
 console.log("OH-MY-PI PEER SMOKE OK ✅");

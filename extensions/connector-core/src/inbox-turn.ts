@@ -100,6 +100,17 @@ export class InboxTurn {
   }
 
   /**
+   * Un-surface a single id that this turn surfaced but could not deliver (e.g. a `steer()`
+   * the session rejected). It drops off the ack set so {@link commit} won't consume it — the
+   * message stays on the stream and redelivers on a later turn. A no-op for an id this turn
+   * never surfaced (or one already evicted by overflow).
+   */
+  unsurface(id: string): void {
+    const i = this.surfacedIds.indexOf(id);
+    if (i !== -1) this.surfacedIds.splice(i, 1);
+  }
+
+  /**
    * Ack the surfaced messages by id — the sole ack site. Call on a terminal status that
    * should consume them: a clean finish, or a failed/dropped turn (drop, no retry-loop). Ids
    * already evicted by the overflow no-op. Do NOT call on interrupt/crash — use

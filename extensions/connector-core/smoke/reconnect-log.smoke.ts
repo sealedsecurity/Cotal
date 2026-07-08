@@ -30,7 +30,7 @@ const cfg: AgentConfig = {
 };
 
 const lines: { msg: string; level: MeshLogLevel }[] = [];
-const agent = new MeshAgent(cfg, (msg, level) => lines.push({ msg, level }));
+const agent = new MeshAgent(cfg, (msg, level) => lines.push({ msg, level: level ?? "info" }));
 const endpointErrors = () => lines.filter((l) => l.msg.includes("endpoint error"));
 
 // Guard: with a logger injected, NOTHING may reach the shared terminal.

@@ -24,8 +24,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json && pnpm run bundle",
     "bundle": "esbuild src/extension.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/extension.bundle.js --external:@oh-my-pi/*",
+    "smoke:peer": "tsx oh-my-pi-peer.smoke.ts",
     "smoke:extension": "tsx oh-my-pi-extension.smoke.ts",
     "smoke:interactive-loop": "tsx interactive-loop.smoke.ts",
+    "test": "pnpm run smoke:peer && pnpm run smoke:extension && pnpm run smoke:interactive-loop",
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
