@@ -54,8 +54,8 @@ console.log("\n── layout-map (pure) ─────────────�
         label: "sealed",
         stacked: true,
         panes: [
-          { command: "/usr/bin/env", cwd: "/tmp" },
-          { command: "/usr/bin/env", cwd: "/tmp" },
+          { command: "/usr/bin/env", args: ["sleep", "600"], cwd: "/tmp" },
+          { command: "/usr/bin/env", args: ["sleep", "600"], cwd: "/tmp" },
         ],
       },
     ],
@@ -70,6 +70,8 @@ console.log("\n── layout-map (pure) ─────────────�
   // Expanded body grammar (not the compact single-line form that fails to deserialize).
   ok("generateKdl uses expanded pane bodies", kdl.includes('pane command="/usr/bin/env" {'));
   ok("generateKdl never emits a compact body", !/\{ *cwd .*; /.test(kdl));
+  // Args survive generation: the command's argv tail is a child `args "…" "…"` node, not dropped.
+  ok("generateKdl emits the args node", kdl.includes('args "sleep" "600"'));
 
   // seedFromDump parses a full-session dump back into a map (round-trip of the shape).
   const seeded = seedFromDump(kdl);
@@ -83,6 +85,38 @@ console.log("\n── layout-map (pure) ─────────────�
     "seedFromDump recovers the sealed panes' commands",
     seeded.tabs[1]?.panes.every((p) => p.command === "/usr/bin/env"),
   );
+  ok(
+    "seedFromDump recovers pane args (argv tail round-trips)",
+    seeded.tabs[1]?.panes.every(
+      (p) => p.args?.length === 2 && p.args[0] === "sleep" && p.args[1] === "600",
+    ),
+  );
+  ok(
+    "seedFromDump recovers pane cwd",
+    seeded.tabs[1]?.panes.every((p) => p.cwd === "/tmp"),
+  );
+
+  // The REAL `dump-layout` grammar: cwd is an INLINE attr on the pane line, args a child node,
+  // start_suspended a child to ignore. This is the form seedFromDump must handle (a synthetic
+  // generateKdl round-trip alone wouldn't catch an inline-cwd / args-child parse gap).
+  const realDump = [
+    'layout {',
+    '    cwd "/home/mattw"',
+    '    tab name="wave" {',
+    '        pane stacked=true {',
+    '            pane command="omp" cwd="agents/workspaces/zheng" {',
+    '                args "--resume"',
+    '                start_suspended true',
+    '            }',
+    '        }',
+    '    }',
+    '}',
+  ].join("\n");
+  const real = seedFromDump(realDump);
+  const rp = real.tabs[0]?.panes[0];
+  ok("seedFromDump parses inline cwd= on the pane line", rp?.cwd === "agents/workspaces/zheng");
+  ok("seedFromDump parses the args child node", rp?.args?.length === 1 && rp.args[0] === "--resume");
+  ok("seedFromDump ignores start_suspended", rp?.command === "omp" && real.tabs[0]?.panes.length === 1);
   // Malformed input degrades to an empty map (best-effort seed, never throws).
   ok("seedFromDump tolerates junk", seedFromDump("not a layout").tabs.length === 0);
 }

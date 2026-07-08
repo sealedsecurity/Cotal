@@ -20,10 +20,12 @@
  */
 
 /** One content pane within a tab. `lane` is an operator label (which wave lane this pane belongs to);
- *  `command`/`cwd` seed what it runs on a fresh boot. All optional — an empty pane is a bare shell. */
+ *  `command`/`args`/`cwd` seed what it runs on a fresh boot. All optional — an empty pane is a bare
+ *  shell. `args` are the command's argv tail (zellij dumps them as a separate `args "…" "…"` node). */
 export interface LayoutPane {
   lane?: string;
   command?: string;
+  args?: string[];
   cwd?: string;
 }
 
@@ -88,17 +90,39 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
     // A stacked tab shows `pane stacked=true { … }` wrapping its children.
     if (/\bstacked=true\b/.test(line) && /^pane\b/.test(line)) cur.stacked = true;
 
-    // A content pane: `pane command="…"` (possibly with a cwd on a following line). Skip plugin/UI.
-    const paneCmd = line.match(/^pane command="((?:[^"\\]|\\.)*)"/);
+    // A content pane: `pane command="…" [cwd="…"] { … }` — command and cwd are INLINE attributes on
+    // the pane line (zellij's dump form), with `args`/`start_suspended` as child nodes below. Skip
+    // plugin/UI panes.
+    const paneCmd = line.match(/^pane\b[^{]*\bcommand="((?:[^"\\]|\\.)*)"/);
     if (paneCmd && !NON_CONTENT_PLUGINS.test(line)) {
-      cur.panes.push({ command: unescapeKdl(paneCmd[1]) });
+      const pane: LayoutPane = { command: unescapeKdl(paneCmd[1]) };
+      const inlineCwd = line.match(/\bcwd="((?:[^"\\]|\\.)*)"/);
+      if (inlineCwd) pane.cwd = unescapeKdl(inlineCwd[1]);
+      cur.panes.push(pane);
     }
-    // A bare `pane` with no command and no plugin is an empty content pane (e.g. a shell).
-    else if (/^pane\s*(\{)?\s*$/.test(line) && !NON_CONTENT_PLUGINS.test(line)) {
-      cur.panes.push({});
+    // A bare content pane: `pane` (optionally with only `cwd`/`expanded`/`focus` attrs) — an empty
+    // shell. Exclude structural WRAPPERS that open a `{` and hold child panes: `pane stacked=true`,
+    // and the plugin frames `pane size=1 borderless=true` (tab-/status-bar). Those are not content.
+    else if (
+      /^pane\b/.test(line) &&
+      !/\b(command|stacked|size|borderless|plugin)=/.test(line) &&
+      !NON_CONTENT_PLUGINS.test(line)
+    ) {
+      const pane: LayoutPane = {};
+      const inlineCwd = line.match(/\bcwd="((?:[^"\\]|\\.)*)"/);
+      if (inlineCwd) pane.cwd = unescapeKdl(inlineCwd[1]);
+      cur.panes.push(pane);
     }
 
-    // `cwd "…"` attaches to the most recent pane in this tab.
+    // `args "a" "b" …` is a child node of the most recent pane — the command's argv tail. Without it
+    // a seeded `omp --resume` regenerates as a bare `omp`, booting the wrong process.
+    const argsLine = line.match(/^args\s+(.+)$/);
+    if (argsLine && cur.panes.length > 0) {
+      const toks = argsLine[1].match(/"((?:[^"\\]|\\.)*)"/g);
+      if (toks) cur.panes[cur.panes.length - 1].args = toks.map((t) => unescapeKdl(t.slice(1, -1)));
+    }
+
+    // Fallback: a child `cwd "…"` node (older/alternate dump form) also attaches to the last pane.
     const cwd = line.match(/^cwd "((?:[^"\\]|\\.)*)"/);
     if (cwd && cur.panes.length > 0) cur.panes[cur.panes.length - 1].cwd = unescapeKdl(cwd[1]);
   }
@@ -137,13 +161,16 @@ export function generateKdl(map: LayoutMap): string {
 }
 
 /** Render one pane at `indentLevel` (units of 4 spaces). A pane with a command emits the expanded
- *  body grammar; a bare pane is a single `pane` node. `cwd` becomes a `cwd "…"` child. */
+ *  body grammar; a bare pane is a single `pane` node. `cwd`/`args` become child nodes. A bare pane
+ *  never carries args (args without a command is meaningless), so they're only emitted with one. */
 function renderPane(pane: LayoutPane, indentLevel: number): string {
   const pad = "    ".repeat(indentLevel);
   if (!pane.command) {
     return pane.cwd ? `${pad}pane cwd="${escapeKdl(pane.cwd)}"` : `${pad}pane`;
   }
   const lines = [`${pad}pane command="${escapeKdl(pane.command)}" {`];
+  if (pane.args && pane.args.length > 0)
+    lines.push(`${pad}    args ${pane.args.map((a) => `"${escapeKdl(a)}"`).join(" ")}`);
   if (pane.cwd) lines.push(`${pad}    cwd "${escapeKdl(pane.cwd)}"`);
   lines.push(`${pad}}`);
   return lines.join("\n");
