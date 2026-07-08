@@ -184,8 +184,8 @@ async function upManifest(file: string, opts: UpManifestFlags): Promise<void> {
   } catch (e) {
     failManifest(e);
   }
-  if (opts.runtime && !["pty", "tmux", "cmux"].includes(opts.runtime)) {
-    console.error(c.red(`✗ unknown --runtime "${opts.runtime}" — expected pty, tmux, or cmux`));
+  if (opts.runtime && !["pty", "tmux", "cmux", "zellij"].includes(opts.runtime)) {
+    console.error(c.red(`✗ unknown --runtime "${opts.runtime}" — expected pty, tmux, cmux, or zellij`));
     process.exit(1);
   }
   // Apply CLI overrides to one effective manifest (flag > manifest > default) so render + seed +

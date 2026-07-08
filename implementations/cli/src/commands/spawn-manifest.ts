@@ -46,7 +46,7 @@ export interface SpawnManifestFlags {
   allowStale?: string[];
 }
 
-const RUNTIMES = ["pty", "tmux", "cmux"];
+const RUNTIMES = ["pty", "tmux", "cmux", "zellij"];
 
 /** Short control-plane probe to tell a LIVE lease-holder from a stale lease a crashed manager left
  *  behind (its key lingers until the bucket TTL). Kept well under {@link MANAGER_LEASE_TTL_MS}. */

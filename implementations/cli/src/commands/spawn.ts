@@ -70,7 +70,7 @@ export function spawnComplete(argv: string[]): CompletionResult {
     return { items: listDeclaredChannels().map((value) => ({ value, description: "declared channel" })), directive: "nofiles" };
   if (flag && ["cwd", "file", "creds"].includes(flag.name)) return { items: [], directive: "default" };
   if (flag?.name === "runtime")
-    return { items: ["pty", "tmux", "cmux"].map((value) => ({ value })), directive: "nofiles" };
+    return { items: ["pty", "tmux", "cmux", "zellij"].map((value) => ({ value })), directive: "nofiles" };
 
   const positionals = positionalsForCompletion(argv, spawnFlags);
   // Only the first word after `spawn` is the persona positional; once it's typed, defer to the shell.
