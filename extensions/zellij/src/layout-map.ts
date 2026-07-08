@@ -40,6 +40,9 @@ export interface LayoutTab {
 /** A full multi-tab arrangement. `version` pins the schema for forward migration. */
 export interface LayoutMap {
   version: 1;
+  /** Layout-level base cwd (zellij emits `cwd "…"` at the top of a dump). Relative pane cwds resolve
+   *  against it, so it must round-trip or a regenerated pane boots in the wrong directory. */
+  cwd?: string;
   tabs: LayoutTab[];
 }
 
@@ -58,14 +61,14 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
   const tabs: LayoutTab[] = [];
   const lines = dumpKdl.split("\n");
   let cur: LayoutTab | null = null;
-  let depth = 0; // brace depth relative to the tab body; panes live at the tab's direct child level
+  let layoutCwd: string | undefined; // layout-level `cwd "…"` (before any tab); relative pane cwds resolve against it
   let inSwapOrTemplate = false;
   let swapDepth = 0;
-  let inPluginPane = false; // inside a `pane size=1 borderless=true { plugin … }` UI frame — skip wholesale
+  let inPluginPane = false; // inside a plugin/UI frame pane (`pane … { plugin … }`) — skip wholesale
   let pluginDepth = 0;
 
-  for (const raw of lines) {
-    const line = raw.trim();
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx].trim();
 
     // Skip the swap_*_layout / new_tab_template blocks entirely — regenerated on boot, not content.
     if (/^(swap_tiled_layout|swap_floating_layout|new_tab_template)\b/.test(line)) {
@@ -78,11 +81,17 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
       continue;
     }
 
-    // Skip plugin/UI frame panes wholesale — `pane size=1 borderless=true { plugin location="…" }`
-    // (tab-/status-bar). They hold no agent content, so their children (a stray `cwd`/`args`) must
-    // never leak onto the last real pane. Keyed on size/borderless — NOT `stacked=true`, whose
-    // children ARE content.
-    if (/^pane\b[^{]*\b(?:size|borderless)=/.test(line) && /\{/.test(line)) {
+    // Skip plugin/UI frame panes wholesale — a `pane … { plugin location="…" }` (tab-/status-bar).
+    // Detected by an ACTUAL `plugin` child (bounded lookahead), NOT by size/borderless: those attrs
+    // are legal on real content panes too (`pane size="50%" command="vim"`), so keying on them would
+    // drop genuine content. A frame holds no agent content, so its children (a stray `cwd`/`args`)
+    // must never leak onto the last real pane.
+    if (
+      /^pane\b/.test(line) &&
+      !/\bcommand=/.test(line) &&
+      /\{\s*$/.test(line) &&
+      paneBlockHasPlugin(lines, idx)
+    ) {
       inPluginPane = true;
       pluginDepth = 0;
     }
@@ -96,19 +105,21 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
     if (tabMatch) {
       if (cur) tabs.push(cur);
       cur = { label: unescapeKdl(tabMatch[1]), panes: [] };
-      depth = 0;
       continue;
     }
 
-    if (!cur) continue;
-    depth += countBraces(line);
+    // Layout-level `cwd "…"` appears before any tab; capture it as the map's base cwd.
+    if (!cur) {
+      const topCwd = line.match(/^cwd "((?:[^"\\]|\\.)*)"/);
+      if (topCwd) layoutCwd = unescapeKdl(topCwd[1]);
+      continue;
+    }
 
-    // A stacked tab shows `pane stacked=true { … }` wrapping its children.
+    // A stacked tab shows `pane stacked=true { … }` wrapping its children (which ARE content).
     if (/\bstacked=true\b/.test(line) && /^pane\b/.test(line)) cur.stacked = true;
 
     // A content pane: `pane command="…" [cwd="…"] { … }` — command and cwd are INLINE attributes on
-    // the pane line (zellij's dump form), with `args`/`start_suspended` as child nodes below. Skip
-    // plugin/UI panes.
+    // the pane line (zellij's dump form), with `args`/`start_suspended` as child nodes below.
     const paneCmd = line.match(/^pane\b[^{]*\bcommand="((?:[^"\\]|\\.)*)"/);
     if (paneCmd && !NON_CONTENT_PLUGINS.test(line)) {
       const pane: LayoutPane = { command: unescapeKdl(paneCmd[1]) };
@@ -116,12 +127,14 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
       if (inlineCwd) pane.cwd = unescapeKdl(inlineCwd[1]);
       cur.panes.push(pane);
     }
-    // A bare content pane: `pane` (optionally with only `cwd`/`expanded`/`focus` attrs) — an empty
-    // shell. Exclude structural WRAPPERS that open a `{` and hold child panes: `pane stacked=true`,
-    // and the plugin frames `pane size=1 borderless=true` (tab-/status-bar). Those are not content.
+    // A bare content pane is a LEAF: `pane`, `pane cwd="…"`, `pane focus=true` with no child block.
+    // A `pane` that OPENS a block (`pane {`, `pane split_direction="vertical" {`, `pane stacked=true
+    // {`) is a structural WRAPPER — its child panes are the real content, captured on their own
+    // lines — so the wrapper line itself must not be recorded as an (empty) content pane.
     else if (
       /^pane\b/.test(line) &&
-      !/\b(command|stacked|size|borderless|plugin)=/.test(line) &&
+      !/\bstacked=/.test(line) &&
+      !/\{\s*$/.test(line) &&
       !NON_CONTENT_PLUGINS.test(line)
     ) {
       const pane: LayoutPane = {};
@@ -144,7 +157,9 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
   }
   if (cur) tabs.push(cur);
 
-  return { version: 1, tabs };
+  const map: LayoutMap = { version: 1, tabs };
+  if (layoutCwd !== undefined) map.cwd = layoutCwd;
+  return map;
 }
 
 /**
@@ -155,6 +170,7 @@ export function seedFromDump(dumpKdl: string): LayoutMap {
  */
 export function generateKdl(map: LayoutMap): string {
   const out: string[] = ["layout {"];
+  if (map.cwd) out.push(`    cwd "${escapeKdl(map.cwd)}"`);
   for (const tab of map.tabs) {
     out.push(`    tab name="${escapeKdl(tab.label)}" {`);
     const body = tab.panes.length > 0 ? tab.panes : [{}];
@@ -203,6 +219,20 @@ function countBraces(line: string): number {
     else if (!inStr && ch === "}") n--;
   }
   return n;
+}
+
+/** Bounded lookahead: does the `pane … {` block that OPENS at `lines[startIdx]` hold a `plugin`
+ *  child node? Identifies a plugin/UI frame (tab-/status-bar) precisely, vs a real content pane that
+ *  merely carries `size`/`borderless`. Scans only this one brace-balanced block. */
+function paneBlockHasPlugin(lines: string[], startIdx: number): boolean {
+  let d = 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    const l = lines[i].trim();
+    d += countBraces(l);
+    if (i > startIdx && /^plugin\b/.test(l)) return true;
+    if (d <= 0) return false; // block closed without a plugin child
+  }
+  return false;
 }
 
 /** Escape a value for a KDL double-quoted string. */

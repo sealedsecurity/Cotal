@@ -10,6 +10,9 @@ import { ZellijRuntime, zellijRuntimeProvider, zellijTerminalProvider } from "./
 import { seedFromDump, generateKdl, type LayoutMap } from "./src/layout-map.js";
 
 const SESSION = "cotal-zellij-smoke";
+// The placement subtest's session — hoisted so the global cleanup + signal handlers reap it too
+// (it spawns a detached `script` client that must not outlive an abrupt exit).
+const PSESSION = "cotal-zellij-smoke-placement";
 let passed = 0;
 let failed = 0;
 
@@ -35,10 +38,14 @@ function throws(label: string, fn: () => unknown): void {
 }
 
 function cleanup(): void {
-  try {
-    execFileSync("zellij", ["delete-session", "--force", SESSION], { stdio: "ignore" });
-  } catch {
-    /* no such session — fine */
+  // Reap BOTH live sessions (main + placement). delete-session --force also kills the placement
+  // section's detached headless client, so no stray session or client process survives.
+  for (const s of [SESSION, PSESSION]) {
+    try {
+      execFileSync("zellij", ["delete-session", "--force", s], { stdio: "ignore" });
+    } catch {
+      /* no such session — fine */
+    }
   }
 }
 
@@ -145,6 +152,50 @@ console.log("\n── layout-map (pure) ─────────────�
   );
   // Malformed input degrades to an empty map (best-effort seed, never throws).
   ok("seedFromDump tolerates junk", seedFromDump("not a layout").tabs.length === 0);
+
+  // Regression (coderabbit/cubic P2): a REAL content pane may carry size=/borderless= (e.g.
+  // `pane size="50%" command="vim"`). The plugin-frame skip must key on an actual `plugin` CHILD,
+  // not on size/borderless — else genuine content is dropped.
+  const sizedContent = [
+    'layout {',
+    '    tab name="t" {',
+    '        pane size="50%" command="vim" {',
+    '            args "file.txt"',
+    '        }',
+    '    }',
+    '}',
+  ].join("\n");
+  const sc = seedFromDump(sizedContent).tabs[0]?.panes[0];
+  ok(
+    "seedFromDump keeps a sized content pane (plugin-skip needs a plugin child, not size/borderless)",
+    sc?.command === "vim" && sc.args?.length === 1 && sc.args[0] === "file.txt",
+  );
+
+  // Regression (cubic P2): a `pane split_direction="…" { … }` is a structural WRAPPER; its child
+  // panes are the content. The wrapper line itself must not be recorded as an extra empty shell.
+  const splitWrap = [
+    'layout {',
+    '    tab name="t" {',
+    '        pane split_direction="vertical" {',
+    '            pane command="a"',
+    '            pane command="b"',
+    '        }',
+    '    }',
+    '}',
+  ].join("\n");
+  const sw = seedFromDump(splitWrap).tabs[0];
+  ok(
+    "seedFromDump treats split_direction as a wrapper (no phantom empty pane)",
+    sw?.panes.length === 2 && sw.panes.every((p) => p.command !== undefined),
+  );
+
+  // Regression (cubic P2): layout-level `cwd "…"` (the base for relative pane cwds) must round-trip;
+  // dropping it would reboot a relative-cwd pane in the wrong directory.
+  const withTopCwd = seedFromDump(
+    ['layout {', '    cwd "/home/mattw"', '    tab name="t" {', '        pane', '    }', '}'].join("\n"),
+  );
+  ok("seedFromDump captures the layout-level cwd", withTopCwd.cwd === "/home/mattw");
+  ok("generateKdl re-emits the layout-level cwd", generateKdl(withTopCwd).includes('cwd "/home/mattw"'));
 }
 
 // Needs a real zellij. Skip cleanly where it isn't installed (local `pnpm check` on a zellij-less
@@ -157,7 +208,15 @@ if (!zellij.available()) {
 // Guarantee teardown on ANY exit — normal, `process.exit(1)` on failure, or an uncaught throw
 // mid-body (the header's "cleans up on pass or fail" promise). Registered before the first live
 // session is created; `cleanup` is sync + idempotent, so a later explicit call would only no-op.
+// `exit` does NOT fire on SIGINT/SIGTERM (Ctrl-C, `kill`), so handle those explicitly — re-exit so
+// the `exit` hook still runs and the signal's non-zero status is preserved.
 process.on("exit", cleanup);
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    cleanup();
+    process.exit(1);
+  });
+}
 
 cleanup(); // start fresh
 
@@ -266,7 +325,6 @@ console.log("\n── placement (pane-into-tab; the runtime auto-attaches a clie
 // section spawns placement agents WITHOUT pre-attaching its own client and proves they come up live.
 // ensureClient uses `script` (util-linux); skip honestly if it's absent (the fix can't work without it).
 {
-  const PSESSION = "cotal-zellij-smoke-placement";
   let hasScript = true;
   try {
     execFileSync("script", ["--version"], { stdio: "ignore" });
@@ -276,11 +334,6 @@ console.log("\n── placement (pane-into-tab; the runtime auto-attaches a clie
   if (!hasScript) {
     console.log("  ⏭  `script` (util-linux) not available — skipping live placement (ensureClient needs it).");
   } else {
-    try {
-      execFileSync("zellij", ["delete-session", "--force", PSESSION], { stdio: "ignore" });
-    } catch {
-      /* none — fine */
-    }
     try {
       const rt = new ZellijRuntime(PSESSION);
       const place = { tab: "lane", stacked: true } as const;
@@ -295,16 +348,21 @@ console.log("\n── placement (pane-into-tab; the runtime auto-attaches a clie
       ok("placement: laneA is running (pane really spawned, not exited)", a.status() === "running");
       ok("placement: laneB is running", b.status() === "running");
 
+      // Regression (cubic P1: per-pane confirm routing): the "lane" tab holds 2 panes, and a confirm
+      // must target each pane's OWN id (scheduleConfirmPane) — a tab-focus Enter reaches only the
+      // last-focused pane. Checked HERE, before the adhoc tab below steals focus. laneB was the last
+      // spawn, so the lane tab's focused pane is a concrete `terminal_N` that `paneExists` confirms is
+      // independently addressable — exactly the per-pane target the fix routes the confirm to. (The
+      // per-pane teardown below independently proves laneA's distinct id is separately targetable.)
+      const laneFocused = zellij.focusedPaneId(PSESSION);
+      ok(
+        "confirm-routing: focused lane pane resolves to an addressable pane id (per-pane confirm target)",
+        laneFocused !== null && /^terminal_\d+$/.test(laneFocused) && zellij.paneExists(PSESSION, laneFocused),
+      );
+
       // ad-hoc tab still works after placement (the fluid-tab guarantee).
       zellij.goToTabNameCreate(PSESSION, "adhoc");
       ok("placement: an ad-hoc tab can still be created after placement", zellij.tabNames(PSESSION).includes("adhoc"));
-
-      // Regression (cubic P1: per-pane confirm routing): the "lane" tab now holds 2 panes. A confirm
-      // must target each pane's OWN id (scheduleConfirmPane), not a tab-focus Enter that only reaches
-      // the last-focused pane. Prove the inputs the fix routes on: the focused pane resolves to a
-      // concrete terminal id, and paneExists confirms both lane panes are independently addressable.
-      const focused = zellij.focusedPaneId(PSESSION);
-      ok("confirm-routing: a content pane id resolves (per-pane confirm target, not tab-focus)", focused !== null && /^terminal_\d+$/.test(focused));
 
       // Per-pane teardown: stopping laneA leaves laneB alive (shared tab, precise close).
       a.stop({ graceful: false });

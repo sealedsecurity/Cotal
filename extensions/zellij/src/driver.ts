@@ -68,38 +68,39 @@ export function hasClient(session: string): boolean {
 }
 
 /** Ensure `session` has an attached client, spawning a detached headless PTY one if none is present.
- *  The PLACEMENT path needs this: pane-id ops (`new-pane`/`list-panes`/`close-pane -p`) silently no-op
- *  against a client-less background session — a placed pane never actually spawns and then reads as
- *  `exited` (verified on zellij 0.44.3). A real client makes them reliable; `zellij attach` needs a
- *  PTY, so wrap it in `script -qec` (util-linux). The client is `detached`+`unref`'d so it outlives
- *  this process — it's session-scoped (reaped when the session is deleted), NOT manager-scoped. The
- *  human's own later `zellij attach` simply adds a second client (zellij multiplexes). Idempotent:
- *  skipped when a client (this one, or the human) is already attached. Best-effort — a missing
- *  `script` is not fatal; the caller still surfaces any resulting pane failure. */
-export function ensureClient(session: string): void {
-  if (hasClient(session)) return;
-  try {
-    const client = spawn("script", ["-qec", `zellij attach ${session}`, "/dev/null"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    client.unref();
-  } catch {
-    /* `script` not on PATH — placement pane ops may be unreliable; caller surfaces the failure. */
-    return;
-  }
+ *  Returns whether a client is attached on return. The PLACEMENT path needs this: pane-id ops
+ *  (`new-pane`/`list-panes`/`close-pane -p`) silently no-op against a client-less background session
+ *  — a placed pane never actually spawns and then reads as `exited` (verified on zellij 0.44.3). A
+ *  real client makes them reliable; `zellij attach` needs a PTY, so wrap it in `script` (util-linux).
+ *  The command is passed via `script`'s STRUCTURAL `-- <cmd> [args…]` form (never `-c "…"`), so the
+ *  session name is an argv token — no shell, matching the injection-free invariant of this driver.
+ *  The client is `detached`+`unref`'d so it outlives this process — session-scoped (reaped when the
+ *  session is deleted), NOT manager-scoped. The human's own later `zellij attach` simply adds a
+ *  second client (zellij multiplexes). Idempotent: skipped when a client (this one, or the human) is
+ *  already attached. `script` missing/unspawnable → returns `false` so the caller can fail loud. */
+export function ensureClient(session: string): boolean {
+  if (hasClient(session)) return true;
+  const client = spawn("script", ["-qe", "/dev/null", "--", "zellij", "attach", session], {
+    detached: true,
+    stdio: "ignore",
+  });
+  // `spawn` reports a missing/unspawnable `script` ASYNCHRONOUSLY via an `error` event, never a sync
+  // throw — an unhandled one crashes the process, so swallow it (the busy-wait below then times out
+  // and we return false). Best-effort: a missing `script` is not fatal, the caller surfaces it.
+  client.on("error", () => {});
+  client.unref();
   // Block until the client is actually attached (≈140ms locally on 0.44.3), so a caller's subsequent
   // pane op sees a real client. Bounded busy-wait via a synchronous `sleep` child — `spawn` can't be
-  // awaited from the sync spawn path. Give up after ~3s and let the caller proceed (best-effort).
+  // awaited from the sync spawn path. Give up after ~3s (client never attached — e.g. no `script`).
   for (let i = 0; i < 30; i++) {
-    if (hasClient(session)) return;
+    if (hasClient(session)) return true;
     try {
       execFileSync("sleep", ["0.1"], { stdio: "ignore" });
     } catch {
-      /* sleep unavailable — stop waiting */
-      return;
+      return false; // sleep unavailable — stop waiting
     }
   }
+  return false;
 }
 
 /** Every `zellij action` for `session` runs as a client against that specific session

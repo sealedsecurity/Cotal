@@ -141,9 +141,17 @@ export class ZellijRuntime implements Runtime {
     confirm: string | undefined,
   ): AgentHandle {
     const tab = placement.tab as string;
-    // Placement pane-id ops need an attached client (a client-less background session silently
-    // no-ops `new-pane`, so the pane reads as exited). Ensure one before splitting the tab.
-    zellij.ensureClient(this.session);
+    // Placement pane-id ops need an attached client: a client-less background session silently no-ops
+    // `new-pane`, so the pane never spawns and reads as `exited`. Fail loud if we can't get one (no
+    // `script` on PATH, attach timed out) rather than spawn a pane that will silently look dead —
+    // AGENTS.md: no silent fallback. The manager surfaces this as a spawn failure.
+    if (!zellij.ensureClient(this.session)) {
+      throw new Error(
+        `zellij runtime: cannot place agent "${name}" into tab "${placement.tab}" — no client could ` +
+          `be attached to background session "${this.session}" (pane-id ops need one; is \`script\` ` +
+          `(util-linux) on PATH?).`,
+      );
+    }
     // Focus (creating on demand) the target tab so the new pane lands inside it.
     zellij.goToTabNameCreate(this.session, tab);
     const paneId = zellij.newPane(this.session, argv, cwd, {

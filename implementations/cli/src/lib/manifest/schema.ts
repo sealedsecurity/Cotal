@@ -36,7 +36,7 @@ const AgentEntryObject = z
         tab: z
           .string()
           .min(1)
-          .refine((s) => !s.startsWith("-") && !/[\x00-\x1f]/.test(s), {
+          .refine((s) => !s.startsWith("-") && !/\p{Cc}/u.test(s), {
             message: "placement.tab must not start with '-' and have no control chars",
           })
           .optional(),
