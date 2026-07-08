@@ -134,6 +134,9 @@ class StubSession implements PeerSession {
   /** Opt-in: when `true`, `steer()` records then REJECTS (the fold couldn't reach the model
    *  turn). Default `false` (records + resolves as before). */
   steerReject = false;
+  /** Opt-in: when `true`, `dispose()` records then REJECTS (an SDK teardown that throws).
+   *  Default `false` (records + resolves as before, so tests 1-9 are unchanged). */
+  disposeReject = false;
   private listeners: ((event: AgentSessionEvent) => void)[] = [];
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {
@@ -157,8 +160,11 @@ class StubSession implements PeerSession {
   async abort(): Promise<void> {
     this.aborted++;
   }
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
     this.disposed++;
+    // A non-async return so a rejected dispose settles in ONE microtask (mirrors `steer`) — the
+    // loop's `.catch(log)` then swallows it and `shutdown()` still resolves.
+    return this.disposeReject ? Promise.reject(new Error("dispose rejected")) : Promise.resolve();
   }
 }
 
@@ -337,5 +343,63 @@ console.log("7) declined prompt completes the turn (no wedge) OK ✅");
   assert(session.steers.length === 1, "the fold attempted the steer exactly once");
 }
 console.log("8) rejected steer un-surfaces its message (redelivers) OK ✅");
+
+// 9) the steer-ack RACE (agent_end commits before the rejection's .catch runs): the stricter
+//    sibling of test 8. Test 8 drains BEFORE agent_end, so the rejected fold's
+//    `.catch → unsurface` has already run and commit() sees a2 gone — it passes even on the
+//    intermediate c09b21e (plain `.catch(→unsurface)` fold + immediate commit()). Here we do NOT
+//    drain at the critical point: we emit agent_end in the SAME tick the steer rejected, so
+//    commit() runs while a2's rejection `.catch` is still a queued microtask. Only the final fix
+//    (7c73207: un-surface every still-pending fold in agent_end, before commit) survives — on
+//    c09b21e commit() acks a2 before the late `.catch` (which then no-ops on a reset turn) and a2
+//    is lost.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("a1", "alice", "q1")];
+  session.steerReject = true; // the fold's steer will reject (never reaches the model turn)
+  runPeerLoop({ mesh, session });
+  session.emit(START); // turn live, streaming
+  mesh.arrive(dm("a2", "alice", "q2")); // same scope → foldSameScope surfaces a2, steer() rejects
+  // RACE WINDOW: do NOT drain. Emit agent_end immediately — commit() runs while a2's rejection
+  // `.catch` is still queued, so only the final fix's in-agent_end un-surface saves a2.
+  session.emit(end("ans")); // terminal → commit
+  await drain(); // now let the steer rejection's `.catch` settle before asserting
+  assert(ids(mesh.acked) === "a1",
+    "RACE: only the delivered origin a1 acked; the rejected fold a2 is not (c09b21e acks a1,a2)");
+  assert(mesh.items.some((x) => x.id === "a2"),
+    "RACE: a2 stayed on the stream → redelivers (c09b21e loses it)");
+  assert(session.steers.length === 1, "the fold attempted the steer exactly once");
+}
+console.log("9) steer-ack race: agent_end before rejection settles does not ack the fold OK ✅");
+
+// 10) a rejecting dispose() must NOT reject loop.shutdown(): peer.ts does `await loop.shutdown()`
+//     THEN `await mesh.stop()`. If shutdown() rejects (an SDK dispose() that throws), mesh.stop()
+//     is skipped → the peer leaves a ghost presence on the mesh. The final fix
+//     (`await session.dispose().catch(log)`) swallows the dispose failure so shutdown() resolves;
+//     on c09b21e (bare `await session.dispose()`) it rejects.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("s1", "alice")];
+  session.disposeReject = true; // the SDK teardown will throw
+  const loop = runPeerLoop({ mesh, session });
+  // Complete a turn so turn.inFlight is false at shutdown and it goes straight to the dispose() line.
+  session.emit(START);
+  await drain();
+  session.emit(end("x"));
+  await drain();
+  let resolved = false;
+  try {
+    await loop.shutdown();
+    resolved = true;
+  } catch {
+    resolved = false;
+  }
+  assert(resolved === true,
+    "loop.shutdown() RESOLVED despite the rejecting dispose (c09b21e rejects → mesh.stop skipped)");
+  assert(session.disposed === 1, "dispose was still attempted exactly once");
+}
+console.log("10) rejecting dispose does not reject shutdown (mesh.stop still runs) OK ✅");
 
 console.log("OH-MY-PI PEER SMOKE OK ✅");
