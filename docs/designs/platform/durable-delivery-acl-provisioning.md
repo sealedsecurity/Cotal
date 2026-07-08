@@ -59,6 +59,16 @@ retry `Math.min(30_000, 1000 * 2 ** attempt)`) — proving the row is the whole 
 runtime KV state (wiped by a mesh rebuild / fresh auth regen, e.g. the upcoming `wave` bring-up), so
 it is not the fix; this design is.
 
+> **Scope caveat (the row is the whole gate *for this population*).** Those 7 agents were
+> spawn/manager-provisioned, so they already held their bind-only `dm_<id>` + `dlv_<id>` durables —
+> only the ACL row was missing, which is why committing it alone restored delivery. An agent brought
+> up via `cotal mint` + `exec omp` (this design's target recipe) has **neither** the ACL row **nor**
+> the durables: `cotal mint` is offline (creds only), and only a provisioner can create `dlv_<id>`
+> (the agent is denied `CONSUMER.CREATE` on DLV; `pumpDlv` silently no-ops when it's absent). So the
+> provisioning step must write the **full footprint** — `dm_<id>` + `dlv_<id>` + the ACL row (what
+> `provisionAgent` writes) — not the row alone. Both statements hold: the row is the last-missing
+> gate for a spawned agent; the durables + row are all required for a mint+exec-omp agent.
+
 ## Approach
 
 ### The fork
@@ -96,7 +106,8 @@ Shape: one idempotent TS routine, invoked automatically at the tail of `cotal up
 await kvm.create(aclBucket(opts.space))`; hook point `implementations/cli/src/commands/up.ts:171-175`)
 and exposed as `cotal provision-acl` for re-runs after later mints. Failure posture mirrors the
 delivery daemon at up (`up.ts:284-285` "non-fatal — durable delivery degrades"): log loudly, don't
-kill the broker; the standalone command fails loud (exit 1).
+kill the broker; the standalone command fails loud (exit 1). This soft-fail-at-`up` is the one
+deliberate exception to the "No fallbacks" constraint below, and is spelled out there as such.
 
 ### The spawn completeness half (applies whichever option is chosen)
 
@@ -159,7 +170,11 @@ daemon-less meshes would accrete rows nothing authorizes or GCs.
   script registered in root `package.json` like `:93` `smoke:delivery-boot-retry:auth`). Write the
   failing assertion first, watch it fail, then implement.
 - **No fallbacks — fail loud** on unsupported states (AGENTS.md); docs updated in the same change
-  as behavior (AGENTS.md).
+  as behavior (AGENTS.md). *One deliberate, scoped exception:* the `cotal up` auto-provision hook is
+  non-fatal (see Recommendation) — `up` orchestrates many agents and one provisioning shortfall must
+  not abort the whole bring-up, and the step is re-runnable. The **standalone** `cotal provision-acl`
+  stays hard-fail (exit 1) — a targeted command SHOULD fail loud. This mirrors the delivery daemon's
+  own at-`up` posture (`up.ts:284-285`), so it is a consistent convention, not a silent degrade.
 
 ### Task 1 — shared read-policy derivation helper
 
