@@ -82,9 +82,12 @@ it is not the fix; this design is.
   commits ACL rows for every agent defined in the persona dir (`.cotal/agents/*.md`, enumerated by
   `listPersonas`, `implementations/cli/src/lib/personas.ts:29-46`). Keeps mint offline-pure;
   bring-up becomes one command that also makes every agent non-blind from boot, with no per-agent
-  flag to remember. Trade-offs: provisions from the agent-file set, so an agent minted out-of-band
-  without a persona file isn't covered (edge case; the standalone command still covers it via its
-  creds file); couples ACL provisioning to bring-up; and — the one wrinkle the fork glosses — a row
+  flag to remember. Trade-offs: both `cotal up` and the standalone `cotal provision-acl` enumerate
+  the persona dir via `listPersonas` (agent-files only — it never scans `creds/`), so an agent minted
+  out-of-band with **no persona file** is not covered by either path as specified — a known gap, not
+  a covered case. (Closing it would need a `creds/`-directory scan added to the routine; deferred as
+  an edge case — the mint+exec-omp recipe this design targets always writes a persona file.) Couples
+  ACL provisioning to bring-up; and — the one wrinkle the fork glosses — a row
   is keyed by the agent's **id** (its nkey public key, `packages/core/src/identity.ts:12-17`), so
   provisioning an agent whose creds don't exist yet forces the step to mint them (see Task 2).
 - **(iii) mint gets an opt-in `--commit-acl` flag** (offline by default; commits when passed and the
@@ -207,8 +210,15 @@ For every `listPersonas(root)` entry (skip `error` entries loudly):
 2. **Creds absent**: mint them exactly as `cotal mint <name> --profile agent` would (`newIdentity()`
    + file-derived policy + `writeSecretFile`) — forced by the id-keyed registry: a row cannot exist
    before an identity does. This is what makes fresh-mesh bring-up one command.
-3. `ep.commitAcl(id, allowSubscribe)` (`CotalEndpoint.commitAcl(targetId: string, allowSubscribe: string[]): Promise<void>`,
-   `endpoint.ts:1309-1311`, which rides core `commitAcl`'s CAS).
+3. Provision the **full durable-delivery footprint** for `id`, exactly what `provisionAgent` writes
+   for a spawned agent (the scope caveat above): the bind-only `dm_<id>` + `dlv_<id>` mailboxes the
+   agent cannot self-create (denied `CONSUMER.CREATE` on DM/DLV — only a provisioner may create them),
+   then the ACL row. `ep.provisionDmInbox(id)`; `ep.provisionDlvInbox(id)`; `ep.commitAcl(id,
+   allowSubscribe)` (`CotalEndpoint.commitAcl(targetId: string, allowSubscribe: string[]): Promise<void>`,
+   `endpoint.ts:1309-1311`, which rides core `commitAcl`'s CAS). All three are idempotent
+   (durable create-if-absent + CAS put), so the routine is re-runnable. Committing the row alone
+   (as an earlier draft of this step did) leaves a mint+exec-omp agent with an authorized owner but
+   no per-member durable, so `pumpDlv` silently no-ops and @mention-wake still never lands.
 
 Surfaces: `cotal provision-acl` command (fail-loud, re-runnable, idempotent — `acls.ts:55-56`
 "Idempotent in effect"); auto-invoked at the tail of `cotal up` after `postStart(...)`
@@ -219,7 +229,8 @@ Surfaces: `cotal provision-acl` command (fail-loud, re-runnable, idempotent — 
   `idFromCreds(creds: string): string`, `agentReadPolicy(...)` (Task 1),
   `mintCreds(auth, newIdentity(), "provisioner")` for the privileged cred,
   `new CotalEndpoint({ space, servers, creds, channels: [], consume: false, registerPresence: false, watchPresence: false, watchChannels: false, card })`;
-  produces per-agent `commitAcl(id, allowSubscribe)` writes readable via
+  produces, per agent, `provisionDmInbox(id)` + `provisionDlvInbox(id)` (bind-only DM/DLV durables) +
+  `commitAcl(id, allowSubscribe)` writes readable via
   `readAcl(kv: KV, owner: string): Promise<{ record: AclRecord; revision: number } | undefined>`
   (`acls.ts:37`) /
   `openAclRegistry(nc: NatsConnection, space: string, opts?: { create?: boolean }): Promise<KV>`
