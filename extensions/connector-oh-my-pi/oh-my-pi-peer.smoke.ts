@@ -137,6 +137,18 @@ class StubSession implements PeerSession {
   /** Opt-in: when `true`, `dispose()` records then REJECTS (an SDK teardown that throws).
    *  Default `false` (records + resolves as before, so tests 1-9 are unchanged). */
   disposeReject = false;
+  /** Opt-in (test 14): when `true`, `steer()` records then returns a promise that NEVER settles,
+   *  so a fold stays pending forever. Exercises the BOUNDED deferred commit — the terminal commit
+   *  must still fire (the macrotask boundary wins the race). Default `false` (tests 1-13 unchanged). */
+  steerHang = false;
+  /** Opt-in (test 12): when `true`, `steer()` records then returns a PENDING promise whose reject
+   *  fn is pushed onto {@link rejectSteer}, so the test controls exactly WHEN the fold settles.
+   *  Firing the reject after the fold's turn committed exercises the generation guard. Default
+   *  `false` (tests 1-11/13/14 keep the one-hop resolve/reject path). */
+  deferSteer = false;
+  /** Captured reject fns for deferred steers (see {@link deferSteer}): `rejectSteer[i]()` rejects
+   *  the i-th folded steer on demand. Empty unless `deferSteer` is set. */
+  rejectSteer: (() => void)[] = [];
   private listeners: ((event: AgentSessionEvent) => void)[] = [];
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {
@@ -152,6 +164,16 @@ class StubSession implements PeerSession {
   }
   steer(text: string): Promise<void> {
     this.steers.push(text);
+    // A never-settling steer (test 14): the fold stays pending; the deferred commit must still
+    // fire off its bounded macrotask boundary, so a hung steer can't wedge the turn.
+    if (this.steerHang) return new Promise<void>(() => {});
+    // A test-controlled deferred steer (test 12): capture the reject so the test can settle the
+    // fold at a chosen moment (e.g. AFTER its turn committed, to exercise the generation guard).
+    if (this.deferSteer) {
+      const { promise, reject } = Promise.withResolvers<void>();
+      this.rejectSteer.push(() => reject(new Error("steer rejected (deferred)")));
+      return promise;
+    }
     // A non-async return so a rejected steer settles in ONE microtask (an `async` method would
     // adopt the thenable and take extra ticks) — the loop's `.catch → unsurface` then runs after
     // a single `await Promise.resolve()`, matching how the real session rejects.
@@ -401,5 +423,117 @@ console.log("9) steer-ack race: agent_end before rejection settles does not ack 
   assert(session.disposed === 1, "dispose was still attempted exactly once");
 }
 console.log("10) rejecting dispose does not reject shutdown (mesh.stop still runs) OK ✅");
+
+// 11) an ACCEPTED steer is ACKED, not redelivered (the exact inverse of test 9): a same-scope
+//     fold whose steer() RESOLVES (the session accepted the message into its turn) must be acked
+//     even when agent_end fires in the SAME tick — before the accept's `.then(delete)` microtask
+//     has flushed. The deferred commit awaits the still-pending fold, sees it accepted, and acks
+//     it. Un-acking an accepted fold would REDELIVER a message the model already got (the mesh
+//     dedups only ACKED ids, so an un-acked id re-surfaces to the model). This is the greptile
+//     finding: 6f82f76 un-surfaces every still-pending fold in agent_end unconditionally, so an
+//     accepted-but-not-yet-flushed fold is dropped from the ack set → double delivery.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("a1", "alice", "q1")]; // steer ACCEPTS (default steerReject=false)
+  runPeerLoop({ mesh, session });
+  session.emit(START); // turn live, streaming
+  mesh.arrive(dm("a2", "alice", "q2")); // same scope → fold; steer() RESOLVES, its .then(delete) queued
+  // RACE WINDOW: do NOT drain. Emit agent_end while a2's accept `.then` is still a queued microtask,
+  // so pendingSteers is non-empty → the commit is DEFERRED until the accept settles.
+  session.emit(end("ans"));
+  await drain(); // the deferred commit awaits the accept (microtask) then commits within this tick
+  assert(ids(mesh.acked) === "a1,a2",
+    "ACCEPTED fold a2 is acked with the origin (6f82f76 acks only a1 → a2 redelivers)");
+  assert(!mesh.items.some((x) => x.id === "a2"),
+    "a2 left the stream (acked, won't redeliver); 6f82f76 leaves it → double delivery");
+  assert(session.steers.length === 1, "the fold attempted the steer exactly once");
+}
+console.log("11) accepted steer is acked, not redelivered OK ✅");
+
+// 12) a late steer settle does NOT mutate a LATER turn (cubic P1, the generation guard): a fold's
+//     steer that settles AFTER its turn committed must be a no-op — it must never strip an id the
+//     NEXT turn re-surfaced. Turn 1 folds a2 with a test-controlled (deferred) steer; the fold is
+//     stranded past the macrotask boundary → un-surfaced (redelivered) and turn 1 commits, bumping
+//     the generation. a2 redelivers as turn 2's origin. THEN, while turn 2 holds a2 surfaced-but-
+//     uncommitted, we fire the STALE turn-1 steer reject. On the fixed loop the callback captured
+//     turn 1's generation and no-ops. On 6f82f76 the reject's `.catch` calls turn.unsurface("a2")
+//     on the live turn 2 (no generation guard) → strips a2 from turn 2's ack set → a2 is never
+//     acked and redelivers forever.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  session.deferSteer = true; // turn 1's fold steer stays pending until we fire rejectSteer[0]()
+  mesh.items = [dm("a1", "alice", "q1")];
+  runPeerLoop({ mesh, session });
+  session.emit(START); // turn 1 live
+  mesh.arrive(dm("a2", "alice", "q2")); // fold a2 under generation g0; steer deferred (unsettled)
+  session.emit(end("r1")); // pendingSteers non-empty → deferred commit races the macrotask boundary
+  await drain(); // boundary wins: a2 still pending → un-surfaced (redeliver), turn 1 commits, gen→g1
+  assert(ids(mesh.acked) === "a1", "turn 1 acked only its origin a1; the stranded fold a2 redelivers");
+  assert(session.prompts.length === 2 && session.prompts[1] === framed(dm("a2", "alice", "q2")),
+    "a2 redelivered as turn 2's origin");
+  session.emit(START); // turn 2 live: a2 surfaced, NOT yet committed
+  // Fire the STALE turn-1 (g0) steer reject now, WHILE turn 2 holds a2 surfaced. On the fix the
+  // g0 callback sees generation moved on and no-ops; on 6f82f76 it strips a2 from turn 2.
+  session.rejectSteer[0]();
+  await drain();
+  session.emit(end("r2")); // turn 2 commits
+  await drain();
+  assert(mesh.acked.filter((x) => x.id === "a2").length === 1,
+    "a2 acked exactly once under turn 2; the stale g0 reject was a no-op (6f82f76 strips it → 0)");
+  assert(!mesh.items.some((x) => x.id === "a2"),
+    "a2 left the stream after turn 2 (6f82f76 leaves it surfaced-then-stripped → redelivers)");
+}
+console.log("12) late steer settle does not mutate a later turn (generation guard) OK ✅");
+
+// 13) shutdown blocks further dispatch (cubic P2, the stopped-guards): once shutdown() begins, a
+//     mesh `incoming`/`wake` event must NOT start a new turn on the disposed session. The initial
+//     pump surfaces s1 (prompt pending, no START → not streaming); shutdown abandons it and disposes.
+//     A post-shutdown arrive+wake must not re-pump. 6f82f76's pump() has no stopped guard → the
+//     late incoming starts a turn and prompts the disposed session.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("s1", "alice")];
+  const loop = runPeerLoop({ mesh, session }); // pump → surfaces s1, prompt(s1) pending (no START)
+  await drain(); // let the initial prompt(s1) settle; turn is surfaced-but-not-streaming
+  await loop.shutdown(); // stopped=true; abandon in-flight s1 (redeliver); dispose
+  assert(session.disposed === 1, "shutdown disposed the session");
+  const promptsBefore = session.prompts.length; // exactly the one pre-shutdown s1 prompt
+  mesh.arrive(dm("s2", "bob")); // post-shutdown incoming → pump() must early-return (stopped)
+  mesh.emit("wake"); // post-shutdown wake → pump() must early-return (stopped)
+  await drain();
+  assert(session.prompts.length === promptsBefore,
+    "no new prompt after shutdown (pump stopped-guard); 6f82f76 re-pumps the disposed session");
+}
+console.log("13) shutdown blocks further dispatch (stopped-guard) OK ✅");
+
+// 14) strand safety — a never-settling steer does NOT hang the terminal commit (mercator's
+//     insurance test, a forward guard). The deferred commit races the pending folds against a
+//     one-macrotask boundary, so even a steer that NEVER settles cannot wedge the turn: the
+//     boundary wins, the turn commits (origin acked), and the unconfirmed fold is un-surfaced
+//     (redeliver — the safe direction, since the model may never have received it). This is NOT a
+//     6f82f76 differentiator: 6f82f76 commits synchronously so it also would not hang here. Test 14
+//     GUARDS the new deferred path — it FAILS if someone later drops the boundary and awaits
+//     allSettled unbounded (the commit would then never fire and this test would hang, never
+//     reaching its asserts). See the throwaway boundary-removed probe reported alongside this file.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  session.steerHang = true; // the fold's steer never resolves or rejects
+  mesh.items = [dm("a1", "alice", "q1")];
+  runPeerLoop({ mesh, session });
+  session.emit(START); // turn live, streaming
+  mesh.arrive(dm("a2", "alice", "q2")); // fold a2; steer hangs → a2 stays pending forever
+  session.emit(end("ans")); // pendingSteers non-empty → deferred commit races the boundary
+  await drain(); // ONE macrotask tick — the boundary wins the race, commit fires without the steer
+  assert(mesh.acked.some((x) => x.id === "a1"),
+    "the turn COMMITTED off the bounded wait (a1 acked) — a hung steer did not wedge it");
+  assert(mesh.items.some((x) => x.id === "a2"),
+    "the never-confirmed fold a2 was un-surfaced → stays on the stream to redeliver (safe direction)");
+  assert(session.steers.length === 1, "the hung fold attempted the steer exactly once");
+}
+console.log("14) strand safety: never-settling steer does not hang commit OK ✅");
 
 console.log("OH-MY-PI PEER SMOKE OK ✅");
