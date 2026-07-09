@@ -136,6 +136,19 @@ export function runPeerLoop({ mesh, host }: { mesh: PeerMesh; host: PeerHost }):
 		},
 		onAgentEnd(): void {
 			// turn-end: release the no-interrupt gate, ack the surfaced batch, flush the next.
+			//
+			// Why ackSurfaced() can't ack a still-unconsumed message during an ESC interrupt: we
+			// deliver with deliverAs "nextTurn", so on an interrupt the batch is parked in OMP's hidden
+			// next-turn queue and consumed by a deferred continuation — NOT the interrupted turn. That
+			// looks like it could race (surfaced is armed in drive() before the continuation runs), but
+			// OMP coalesces the wire-level agent_end this handler fires on: #emitSessionEvent
+			// (agent-session.ts:2787-2799) HOLDS agent_end while #promptInFlightCount > 0 and lets a
+			// later agent_end supersede the pending one, so a wire-level subscriber sees ONE agent_end
+			// at the true settle. The interrupted turn + the nextTurn continuation therefore collapse
+			// into a single agent_end that fires AFTER the continuation consumed the batch — so this
+			// ack runs post-consume, never on a stray interrupted-turn event. Backstop even if that
+			// invariant ever broke: ackSurfaced drains only ids still at the inbox front, so an
+			// unconsumed survivor is left unacked and redelivers (fails safe — redelivery, not loss).
 			busy = false;
 			ackSurfaced();
 			if (mesh.pendingWake() > 0) drive();
