@@ -88,27 +88,46 @@ class FakeMesh implements PeerMesh {
 
 interface SentCall {
 	message: { customType: string; content: string; display: boolean; details: unknown; attribution: "user" | "agent" };
-	options: { deliverAs: "steer"; triggerTurn: true };
+	options: { deliverAs: "steer" | "nextTurn"; triggerTurn: true };
 }
 
-/** A fake host that records every sendMessage(message, options). */
+/** A fake host that records every sendMessage AND models OMP's delivery routing, so a test can
+ *  assert the user-visible landing zone (not just the envelope). Mirrors the real routing in
+ *  agent-session.ts `sendCustomMessage`: the deliverAs branch at 7458-7479 sends `nextTurn` to the
+ *  hidden `#queueHiddenNextTurnMessage` queue (never `this.agent.steer()`), while a `steer` reaching
+ *  a session that is still tearing down a user-interrupted (ESC) turn (`interruptUnwinding` here
+ *  models isStreaming still true + #advisorAutoResumeSuppressed latched at 7766-7768) folds via
+ *  this.agent.steer() into the editable pending-message UI = the composer. When idle, either mode
+ *  wakes a fresh turn via #promptAgentInitiatedMessage (7472-7478), so the happy path is identical.
+ *  Keep this fake in sync with agent-session.ts:7458-7479 if OMP's routing changes. */
 class FakeHost implements PeerHost {
 	readonly sent: SentCall[] = [];
+	/** Set true to model OMP still unwinding a user-interrupted (ESC) turn — the bug window. */
+	interruptUnwinding = false;
+	readonly composer: string[] = []; // editable pending UI — a bleed lands here (the defect)
+	readonly held: string[] = []; // hidden next-turn queue — redelivered cleanly on the next turn
+	readonly turns: string[] = []; // a fresh turn woke on this message (the idle happy path)
 	sendMessage(message: SentCall["message"], options: SentCall["options"]): void {
 		this.sent.push({ message, options });
+		if (this.interruptUnwinding) {
+			if (options.deliverAs === "nextTurn") this.held.push(message.content);
+			else this.composer.push(message.content);
+		} else {
+			this.turns.push(message.content);
+		}
 	}
 	get last(): SentCall {
 		return this.sent[this.sent.length - 1];
 	}
 }
 
-/** Assert a sendMessage call carries the fixed steer/turn envelope the loop always uses. */
+/** Assert a sendMessage call carries the fixed nextTurn/turn envelope the loop always uses. */
 function assertEnvelope(call: SentCall, customType: string, ctx: string): void {
 	assert(call.message.customType === customType, `${ctx}: customType === ${customType}`);
 	assert(call.message.display === true, `${ctx}: display true`);
 	assert(call.message.attribution === "user", `${ctx}: attribution "user"`);
 	assert(JSON.stringify(call.message.details) === "{}", `${ctx}: details {}`);
-	assert(call.options.deliverAs === "steer", `${ctx}: deliverAs "steer"`);
+	assert(call.options.deliverAs === "nextTurn", `${ctx}: deliverAs "nextTurn"`);
 	assert(call.options.triggerTurn === true, `${ctx}: triggerTurn true`);
 }
 
@@ -323,6 +342,51 @@ function assertEnvelope(call: SentCall, customType: string, ctx: string): void {
 	await loop.shutdown();
 	assert(mesh.stopCalls === 1, "8) shutdown calls mesh.stop() exactly once");
 	console.log("8) shutdown stops mesh OK ✅");
+}
+
+// ---- 9. ESC-interrupt: a queued message is HELD for redelivery, never bled into the composer ----
+// Repro for the reported defect: hitting ESC to interrupt a running turn while a cotal message is
+// waiting must not land the message text in the editable composer. The connector cannot observe the
+// interrupt (agent_end/ExtensionContext carry no abort reason), so it must deliver in a mode that is
+// hidden-from-composer under OMP's own contract. `nextTurn` is that mode: idle → a fresh turn wakes
+// as before; still-unwinding after an ESC → parked in the hidden next-turn queue, redelivered clean.
+// A `steer` (the pre-fix envelope) bleeds into the composer in that window — this asserts it doesn't.
+{
+	const mesh = new FakeMesh();
+	const host = new FakeHost();
+	const loop = runPeerLoop({ mesh, host });
+
+	// The turn the user is about to ESC out of.
+	loop.onAgentStart();
+	// A directed DM arrives while that turn is live — buffered by the no-interrupt gate, not delivered.
+	const dm = item({ id: "esc1", kind: "dm", text: "peer ping during a turn" });
+	mesh.inbox = [dm];
+	mesh.emit("incoming", dm);
+	assert(host.sent.length === 0, "9) message arriving mid-turn is buffered, not delivered");
+
+	// User hits ESC: OMP aborts with USER_INTERRUPT and is still tearing the turn down when the
+	// connector's turn-end hook fires and flushes the buffered message (pendingWake mirrors the real
+	// MeshAgent reporting the mid-turn arrival as a pending wake, exactly as test 5 drives it).
+	mesh.setPendingWake(1);
+	host.interruptUnwinding = true;
+	loop.onAgentEnd();
+
+	assert(host.sent.length === 1, "9) the buffered message is delivered at turn end");
+	assert(host.composer.length === 0, `9) message must NOT bleed into the composer (got ${JSON.stringify(host.composer)})`);
+	assert(host.held.length === 1 && host.held[0].includes("peer ping during a turn"), "9) message is HELD for clean redelivery");
+	// It stays unacked (still leads the inbox) so it redelivers as a normal peer message next turn.
+	assert(mesh.peekInbox().some((i) => i.id === "esc1"), "9) held message stays on the inbox for redelivery");
+
+	// The other half of the acceptance ("held + redelivered next turn"): the nextTurn delivery already
+	// woke a fresh turn (drive() sent it and armed the surfaced batch). When THAT turn ends cleanly —
+	// no interrupt this time — the held message must ack normally, proving it was held-AND-delivered,
+	// not held-AND-dropped. This is the ack-on-turn-end path (interactive-loop.ts ackSurfaced), which
+	// nextTurn preserves (the message rode a real #promptAgentInitiatedMessage turn).
+	host.interruptUnwinding = false;
+	mesh.setPendingWake(0);
+	loop.onAgentEnd();
+	assert(mesh.peekInbox().length === 0, "9) on the next clean turn-end the redelivered message is acked (drained)");
+	console.log("9) ESC-interrupt holds the message, no composer bleed OK ✅");
 }
 
 console.log("\nCOTAL-MESH LOOP SMOKE OK ✅");

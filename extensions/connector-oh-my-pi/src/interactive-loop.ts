@@ -26,11 +26,15 @@ export interface PeerMesh {
 	on(event: "wake", handler: () => void): void;
 }
 
-/** The host-session surface the loop drives. The extension's `ExtensionAPI` satisfies this. */
+/** The host-session surface the loop drives. The extension's `ExtensionAPI` satisfies this.
+ *  Delivery uses `deliverAs: "nextTurn"`, the one mode OMP's contract keeps hidden from the
+ *  editable pending-message UI: when idle it wakes a fresh turn (same #promptAgentInitiatedMessage
+ *  path as a steer), and when the session is still tearing down a user-interrupted (ESC) turn it is
+ *  parked in the hidden next-turn queue and redelivered — never bled into the composer. */
 export interface PeerHost {
 	sendMessage(
 		message: { customType: string; content: string; display: boolean; details: unknown; attribution: "user" | "agent" },
-		options: { deliverAs: "steer"; triggerTurn: true },
+		options: { deliverAs: "nextTurn"; triggerTurn: true },
 	): void;
 }
 
@@ -82,11 +86,16 @@ export function runPeerLoop({ mesh, host }: { mesh: PeerMesh; host: PeerHost }):
 		}
 		busy = true;
 		surfaced = ids;
-		// The content participates in LLM context (a CustomMessage); triggerTurn wakes an idle session,
-		// steer folds into a live one. Attribution "user" — a peer message is external input here.
+		// The content participates in LLM context (a CustomMessage); triggerTurn wakes an idle session
+		// into a fresh turn. `nextTurn` (not `steer`) is deliberate: the loop only ever delivers when it
+		// believes the session idle (drive() early-returns while busy), so it never needs steer's mid-
+		// turn fold — and steer's one distinguishing behavior is that, arriving while OMP is still
+		// unwinding a user-interrupted (ESC) turn, it surfaces into the editable composer. `nextTurn` is
+		// hidden-from-composer by contract: idle → the same fresh-turn path, mid-unwind → parked +
+		// redelivered. Attribution "user" — a peer message is external input here.
 		host.sendMessage(
 			{ customType: override ? NUDGE : INCOMING, content: text, display: true, details: {}, attribution: "user" },
-			{ deliverAs: "steer", triggerTurn: true },
+			{ deliverAs: "nextTurn", triggerTurn: true },
 		);
 	}
 
