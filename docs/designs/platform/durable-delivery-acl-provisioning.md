@@ -96,6 +96,12 @@ it is not the fix; this design is.
 
 ### Recommendation: (ii)
 
+> **Status (2026-07-09) — fork escalated to core; record NOT frozen.** Matt's call: the
+> ACL-provisioning gap is "more of a core issue with Cotal" than a CLI-layer patch, to be
+> deliberated before diving deeper — filed as **SEA-1168**. (ii) below is the leading candidate and
+> #4 implements it, but the Approach + Plan are not frozen until SEA-1168 decides CLI-layer vs a
+> core fix. See Open Questions.
+
 **(ii)**, provisioning folded into bring-up. The mesh is about to be rebuilt onto the canonical
 `wave` space where the recipe is `cotal up --channels …` + per-agent `cotal mint --profile agent`;
 (ii) is the only option where that recipe yields non-blind agents with zero extra per-agent steps,
@@ -301,27 +307,42 @@ non-blind-from-boot guarantee.
 - [ ] **T4** — e2e non-blind-from-boot assertion; `docs/architecture.md` +
       `docs/getting-started.md` updated in the same change.
 
+## Decisions
+
+Ratified by Matt 2026-07-09 (asked directly, recommendations pre-selected). D1/D2 fix how the
+CLI-provisioning approach behaves; if SEA-1168 (see Open Questions) redirects the fix into core,
+revisit them under that record.
+
+- **D1 — spawn provisions when a daemon is live (was OQ3).** `cotal spawn` replaces the
+  unconditional `durableMembership: false` with auto-detect via the delivery lease
+  (`durableMembership = readDeliveryLease(0) !== undefined`); no new flag. An explicit `--live-only`
+  escape hatch may be added later without changing this default. Designed at Task 3 and "The spawn
+  completeness half".
+- **D2 — `cotal up` mints creds when absent (was OQ4).** The provisioning step writes
+  `creds/<name>.creds` for persona-dir agents that lack them, then provisions the full footprint —
+  ACL rows are id-keyed, so a row cannot exist before an identity does. Fresh-mesh bring-up becomes
+  one command; per-agent `cotal mint` becomes optional. Designed at Task 2 step 2.
+
+Deferred, non-load-bearing (the merge ratifies the deferral):
+
+- **D3 — both surfaces, not either/or (was OQ2).** The record designs one shared routine exposed
+  BOTH as the `cotal up` tail hook AND the standalone re-runnable `cotal provision-acl` — a superset
+  that satisfies either preference, so an executor hits no ambiguity.
+- **D4 — re-mint ACL-row orphans, out of scope (was OQ5).** `cotal mint` always mints a fresh
+  identity, so re-minting a name orphans the old id's row; absent-owner rows are DEFER-inert (never
+  mis-deliver) but accrete. A `deleteAcl`-on-re-mint / GC follow-up is noted, not designed here.
+
 ## Open Questions
 
-Batched for Matt (this design proceeds on the stated assumptions; answers may re-cut it before the
-freeze):
+**FREEZE BLOCKER — this record MUST NOT merge-freeze while this is open** (standing design policy:
+no merge with an unresolved load-bearing open question).
 
-1. **(ii) vs (iii) final call** — does Matt want provisioning folded into bring-up
-   (`cotal up`/persona-dir scan) or an opt-in mint flag? (Main agent + supervisor lean (ii); this
-   record recommends and designs (ii).)
-2. **If (ii): in `cotal up` itself, or a separate `cotal provision-acl` sub-command invoked after
-   `up`?** (Separate is more composable + re-runnable; `up`-integrated is one-command.)
-   *Assumption designed against:* both surfaces over one routine — auto-run at `up`'s tail,
-   plus the standalone command for re-runs after later mints.
-3. **Should spawn's fix require an explicit opt-in, or just auto-provision when a daemon is
-   detected?** *Assumption designed against:* auto-detect via the delivery lease (no new flag);
-   an explicit `--live-only` escape hatch can be added later without changing the default.
-4. *(surfaced)* **Is `cotal up` minting creds files acceptable?** ACL rows are keyed by agent id, so
-   a persona with no creds yet cannot get a row unless the step mints (Task 2 step 2) — `up` would
-   then write `creds/<name>.creds` for persona-dir agents, making the recipe's per-agent
-   `cotal mint` optional. *Assumption:* yes (mint-if-absent); if not, the step skips creds-less
-   personas and `cotal provision-acl` is re-run after mints.
-5. *(surfaced)* **Re-mint orphans:** `cotal mint` always generates a fresh identity (`mint.ts:88`),
-   so re-minting a name orphans the old id's ACL row (absent-owner rows are DEFER-inert but
-   accrete). *Assumption:* out of scope here; a `deleteAcl`-on-re-mint / GC follow-up is noted, not
-   designed.
+1. **The fork is escalated to core, not picked.** Matt's call (2026-07-09): the ACL-provisioning
+   gap is "more of a core issue with Cotal" than a CLI-layer patch — "raise an issue first before
+   we dive too deep … not something we can just fix immediately." Filed as **SEA-1168**
+   (durable-delivery ACL provisioning gap: CLI-provisioning layer vs the core
+   mint(offline)/provision(online) split). The Approach + Plan above stand as the leading (ii)
+   CLI-layer candidate — and #4 implements it — but are NOT frozen until SEA-1168 decides whether
+   the fix lives in the CLI provisioning layer (this record) or in core (e.g. the delivery daemon
+   self-provisions the row on first authorized contact, or the mint/JWT flow carries durable
+   membership directly). Fold SEA-1168's outcome here as a Decision, then freeze.
