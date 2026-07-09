@@ -253,7 +253,7 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
       stopped = true; // block any in-flight prompt/steer/mesh callback from driving a disposed session
       if (turn.inFlight) {
         turn.abandon(); // leave the in-flight run on the stream → redeliver, no peer dropped
-        await session.abort();
+        await session.abort().catch(log); // a rejected abort must not skip dispose()/the caller's mesh.stop()
       }
       await session.dispose().catch(log); // await async cleanup, but never let a dispose failure skip the caller's mesh.stop()
     },
