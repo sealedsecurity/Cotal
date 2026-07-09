@@ -604,27 +604,29 @@ console.log("14) strand safety: never-settling steer does not hang commit OK ✅
 }
 console.log("15) rejecting abort does not reject shutdown (dispose/mesh.stop still run) OK ✅");
 
-// 16) slow-accept steer is STILL acked under a human-scale timeout (#5-killer, load-bearing): the
-//     whole point of B-simple. A fold whose steer() accepts after a REAL settle delay (~5ms — genuine
-//     work, not just one microtask) must still be awaited by the deferred commit and acked, because a
-//     human-scale steerSettleTimeoutMs is generous enough to wait for it. commitAfterSteers races
-//     allSettled(pending) against setTimeout(steerSettleTimeoutMs); with a 50ms boundary the 5ms
-//     accept resolves first, so allSettled wins and a2 is acked. RED at boundary 0 (== the old
-//     setTimeout(0) window): 0 < 5, so the timeout fires before the accept settles → finishTurn
-//     un-surfaces a2 → acked==="a1", a2 redelivers (exactly finding #5). The delay is a REAL 5ms (not
-//     setTimeout(0)) so the race is decided by MAGNITUDE, not timer-registration order — the only
-//     shape that actually goes red at boundary 0. This test FAILS if someone reverts the timeout to a
-//     value below the accept delay (e.g. 0) or drops the param. Red-green evidence in the task report.
+// 16) slow-accept steer is STILL acked under the PRODUCTION-DEFAULT timeout (#5-killer, load-bearing):
+//     the whole point of B-simple. A fold whose steer() accepts after a REAL settle delay (~5ms — genuine
+//     work, not just one microtask) must still be awaited by the deferred commit and acked, because the
+//     production steerSettleTimeoutMs (5_000ms) is generous enough to wait for it. commitAfterSteers races
+//     allSettled(pending) against setTimeout(steerSettleTimeoutMs); with the prod-default 5_000ms boundary
+//     the 5ms accept resolves first (5 << 5_000), so allSettled wins and a2 is acked — the commit provably
+//     comes from allSettled, not the timeout. RED at boundary 0 (== the old setTimeout(0) window): 0 < 5, so
+//     the timeout fires before the accept settles → finishTurn un-surfaces a2 → acked==="a1", a2 redelivers
+//     (exactly finding #5). The delay is a REAL 5ms (not setTimeout(0)) so the race is decided by MAGNITUDE,
+//     not timer-registration order — the only shape that actually goes red at boundary 0. This test FAILS if
+//     someone reverts the timeout to a value below the accept delay (e.g. 0). Exercising the real 5_000ms
+//     default is only safe because #7 now CLEARS the settle timer when allSettled wins — with the leaked
+//     timer this test would hang the process ~5s at exit (see test 18). Red-green evidence in the task report.
 {
   const mesh = new FakeMesh();
   const session = new StubSession();
   session.steerSlowAccept = true; // the fold's steer resolves after a real ~5ms settle (setTimeout 5)
   mesh.items = [dm("a1", "alice", "q1")];
-  runPeerLoop({ mesh, session, steerSettleTimeoutMs: 50 }); // human-scale boundary >> the 5ms accept
+  runPeerLoop({ mesh, session }); // PROD DEFAULT boundary 5_000ms >> the 5ms accept (no override)
   session.emit(START); // turn live, streaming
   mesh.arrive(dm("a2", "alice", "q2")); // same scope → fold; slow-accept steer resolves ~5ms later
   session.emit(end("ans")); // pendingSteers non-empty → deferred commit awaits the slow accept
-  // Wait past the slow accept's ~5ms delay but well UNDER the 50ms timeout, so the commit provably
+  // Wait past the slow accept's ~5ms delay but well UNDER the 5_000ms timeout, so the commit provably
   // comes from allSettled resolving (a2 accepted), NOT from the timeout firing. A real delay (not
   // drain()s): two macrotask ticks (~1ms) would assert before the 5ms accept and the deferred commit.
   await new Promise((r) => setTimeout(r, 20));
@@ -667,5 +669,39 @@ console.log("16) slow-accept steer is still acked under a human-scale timeout (#
     "dispose STILL ran after the sync throw → per-call try/catch let teardown continue (.catch-only → 0)");
 }
 console.log("17) sync-throwing abort still resolves shutdown and runs dispose (#6) OK ✅");
+
+// 18) the settle timer is CLEARED when allSettled wins — no leaked ref'd Timeout handle (#7, the
+//     event-loop-leak seam): commitAfterSteers races allSettled(pendingSteers) against
+//     setTimeout(steerSettleTimeoutMs). On the common path the steer settles fast so allSettled wins,
+//     but the 5_000ms settle timer is still ARMED — if it isn't cleared it stays ref'd on the Node
+//     event loop and delays process/CLI exit by up to steerSettleTimeoutMs (5s default) PER folded
+//     turn. The fix clears it in a `finally` on the allSettled-wins path. We fold a2 with a fast
+//     (~5ms) accept under the PROD default 5_000ms boundary (a leaked handle here is a 5s Timeout),
+//     let the deferred commit run, then assert the active 'Timeout' handle count returned to its
+//     pre-fold baseline — i.e. the settle timer left NO net handle. On /tmp/loop-leak-red.ts (timer
+//     not cleared) the count is before+1. The fold must STILL commit correctly (acked==='a1,a2'), so
+//     the test proves the timer is cleared WITHOUT breaking the commit.
+{
+  const before = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  session.steerSlowAccept = true; // fold's steer resolves after a real ~5ms settle → allSettled wins
+  mesh.items = [dm("a1", "alice", "q1")];
+  runPeerLoop({ mesh, session }); // PROD DEFAULT 5_000ms — a leaked settle timer would be a 5s handle
+  session.emit(START); // turn live, streaming
+  mesh.arrive(dm("a2", "alice", "q2")); // same scope → fold; slow-accept steer resolves ~5ms later
+  session.emit(end("ans")); // pendingSteers non-empty → commitAfterSteers races allSettled vs setTimeout(5_000)
+  // Wait past the ~5ms accept so allSettled wins the race, then one setImmediate tick so the deferred
+  // commit's `finally` (which clears the settle timer) has run before we sample the handle table.
+  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setImmediate(r));
+  const after = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  assert(after === before,
+    `the 5_000ms settle timer was CLEARED after allSettled won — no leaked Timeout handle ` +
+      `(before=${before}, after=${after}); on the leak-red copy after===before+1 (#7)`);
+  assert(ids(mesh.acked) === "a1,a2",
+    "the fold still committed correctly (a2 acked) — the timer is cleared WITHOUT breaking the commit");
+}
+console.log("18) settle timer is cleared when allSettled wins (no event-loop leak) (#7) OK ✅");
 
 console.log("OH-MY-PI PEER SMOKE OK ✅");
