@@ -105,16 +105,29 @@ class FakeHost implements PeerHost {
 	/** Set true to model OMP still unwinding a user-interrupted (ESC) turn — the bug window. */
 	interruptUnwinding = false;
 	readonly composer: string[] = []; // editable pending UI — a bleed lands here (the defect)
-	readonly held: string[] = []; // hidden next-turn queue — redelivered cleanly on the next turn
-	readonly turns: string[] = []; // a fresh turn woke on this message (the idle happy path)
+	readonly held: string[] = []; // hidden next-turn queue — parked, awaiting the deferred continuation
+	readonly turns: string[] = []; // content a real turn actually consumed (idle wake, or a held flush)
 	sendMessage(message: SentCall["message"], options: SentCall["options"]): void {
 		this.sent.push({ message, options });
 		if (this.interruptUnwinding) {
+			// Mid-unwind: nextTurn parks in the hidden queue (#queueHiddenNextTurnMessage, 7459); a
+			// steer would instead fold via this.agent.steer() into the editable composer (7466).
 			if (options.deliverAs === "nextTurn") this.held.push(message.content);
 			else this.composer.push(message.content);
 		} else {
+			// Idle: either mode wakes a fresh turn via #promptAgentInitiatedMessage (7472-7478) that
+			// consumes the message immediately.
 			this.turns.push(message.content);
 		}
+	}
+	/** Model OMP draining the hidden next-turn queue into a real turn — the deferred
+	 *  #promptQueuedHiddenNextTurnMessages continuation (7323-7346) that the post-prompt task
+	 *  (7298-7321) runs once the interrupted prompt has settled. Parked content becomes consumed
+	 *  turn content, exactly as a clean redelivery would. Returns what it flushed. */
+	flushHeld(): string[] {
+		const flushed = this.held.splice(0, this.held.length);
+		this.turns.push(...flushed);
+		return flushed;
 	}
 	get last(): SentCall {
 		return this.sent[this.sent.length - 1];
@@ -376,16 +389,19 @@ function assertEnvelope(call: SentCall, customType: string, ctx: string): void {
 	assert(host.held.length === 1 && host.held[0].includes("peer ping during a turn"), "9) message is HELD for clean redelivery");
 	// It stays unacked (still leads the inbox) so it redelivers as a normal peer message next turn.
 	assert(mesh.peekInbox().some((i) => i.id === "esc1"), "9) held message stays on the inbox for redelivery");
-
-	// The other half of the acceptance ("held + redelivered next turn"): the nextTurn delivery already
-	// woke a fresh turn (drive() sent it and armed the surfaced batch). When THAT turn ends cleanly —
-	// no interrupt this time — the held message must ack normally, proving it was held-AND-delivered,
-	// not held-AND-dropped. This is the ack-on-turn-end path (interactive-loop.ts ackSurfaced), which
-	// nextTurn preserves (the message rode a real #promptAgentInitiatedMessage turn).
+	// The other half of the acceptance ("held + redelivered next turn"): prove held-AND-DELIVERED,
+	// not just held-AND-acked. OMP's deferred continuation (#promptQueuedHiddenNextTurnMessages,
+	// 7323-7346) drains the hidden queue into a real turn once the interrupted prompt settles — model
+	// that flush and assert the parked content actually reached a turn before we let the ack stand.
 	host.interruptUnwinding = false;
+	const flushed = host.flushHeld();
+	assert(flushed.length === 1 && flushed[0].includes("peer ping during a turn"), "9) held message is flushed into a real turn (delivered, not dropped)");
+	assert(host.turns.some((t) => t.includes("peer ping during a turn")), "9) the redelivered message was consumed by a turn");
+	// Only now, when that clean turn ends, does the connector ack — draining the peer inbox. This is
+	// the ack-on-turn-end path (interactive-loop.ts ackSurfaced) that nextTurn preserves.
 	mesh.setPendingWake(0);
 	loop.onAgentEnd();
-	assert(mesh.peekInbox().length === 0, "9) on the next clean turn-end the redelivered message is acked (drained)");
+	assert(mesh.peekInbox().length === 0, "9) the message is acked (drained) only after it was delivered into a turn");
 	console.log("9) ESC-interrupt holds the message, no composer bleed OK ✅");
 }
 
