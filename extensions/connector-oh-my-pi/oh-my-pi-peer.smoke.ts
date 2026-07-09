@@ -137,6 +137,9 @@ class StubSession implements PeerSession {
   /** Opt-in: when `true`, `dispose()` records then REJECTS (an SDK teardown that throws).
    *  Default `false` (records + resolves as before, so tests 1-9 are unchanged). */
   disposeReject = false;
+  /** Opt-in: when `true`, `abort()` records then REJECTS (an SDK abort that throws). Default
+   *  `false` (records + resolves as before, so tests 1-14 are unchanged). Mirror of {@link disposeReject}. */
+  abortReject = false;
   /** Opt-in (test 14): when `true`, `steer()` records then returns a promise that NEVER settles,
    *  so a fold stays pending forever. Exercises the BOUNDED deferred commit — the terminal commit
    *  must still fire (the macrotask boundary wins the race). Default `false` (tests 1-13 unchanged). */
@@ -179,8 +182,11 @@ class StubSession implements PeerSession {
     // a single `await Promise.resolve()`, matching how the real session rejects.
     return this.steerReject ? Promise.reject(new Error("steer rejected")) : Promise.resolve();
   }
-  async abort(): Promise<void> {
+  abort(): Promise<void> {
     this.aborted++;
+    // A non-async return so a rejected abort settles in ONE microtask (mirrors `dispose`) — the
+    // loop's `.catch(log)` then swallows it and `shutdown()` still proceeds to dispose()/resolve.
+    return this.abortReject ? Promise.reject(new Error("abort rejected")) : Promise.resolve();
   }
   dispose(): Promise<void> {
     this.disposed++;
@@ -535,5 +541,39 @@ console.log("13) shutdown blocks further dispatch (stopped-guard) OK ✅");
   assert(session.steers.length === 1, "the hung fold attempted the steer exactly once");
 }
 console.log("14) strand safety: never-settling steer does not hang commit OK ✅");
+
+// 15) a rejecting abort() must NOT reject loop.shutdown() (sibling of test 10, one line up): the
+//     shutdown() sequence is `if (turn.inFlight) { turn.abandon(); await session.abort(); } await
+//     session.dispose().catch(log)`. peer.ts does `await loop.shutdown()` THEN `await mesh.stop()`.
+//     If abort() rejects and the loop doesn't swallow it, shutdown() rejects → dispose() is SKIPPED
+//     AND mesh.stop() never runs → ghost peer on the mesh. The fix (`await session.abort().catch(log)`)
+//     swallows the abort failure so teardown continues; on d213837 (bare `await session.abort()`) it
+//     rejects. The abort path only runs when the turn is IN FLIGHT at shutdown, so we emit START (turn
+//     open + streaming) with NO agent_end. `session.disposed === 1` proves teardown continued past the
+//     abort rejection (so mesh.stop would run).
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("s1", "alice")];
+  session.abortReject = true; // the SDK abort will throw
+  const loop = runPeerLoop({ mesh, session });
+  // Hold the turn IN FLIGHT: emit START (streaming, turn open) with no agent_end, so shutdown() enters
+  // the `if (turn.inFlight)` branch and calls abort() (the only path where a rejecting abort matters).
+  session.emit(START);
+  await drain();
+  let resolved = false;
+  try {
+    await loop.shutdown();
+    resolved = true;
+  } catch {
+    resolved = false;
+  }
+  assert(resolved === true,
+    "loop.shutdown() RESOLVED despite the rejecting abort (d213837 rejects → dispose/mesh.stop skipped)");
+  assert(session.aborted === 1, "abort was attempted exactly once (turn was in flight)");
+  assert(session.disposed === 1,
+    "dispose STILL ran after the abort rejection → teardown continued so mesh.stop would run (no ghost peer)");
+}
+console.log("15) rejecting abort does not reject shutdown (dispose/mesh.stop still run) OK ✅");
 
 console.log("OH-MY-PI PEER SMOKE OK ✅");
