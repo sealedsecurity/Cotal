@@ -140,6 +140,11 @@ class StubSession implements PeerSession {
   /** Opt-in: when `true`, `abort()` records then REJECTS (an SDK abort that throws). Default
    *  `false` (records + resolves as before, so tests 1-14 are unchanged). Mirror of {@link disposeReject}. */
   abortReject = false;
+  /** Opt-in (test #6, sync-throw): when `true`, `abort()` increments `aborted` then THROWS
+   *  SYNCHRONOUSLY — the throw happens BEFORE a promise is returned, so a bare `.catch()` on the
+   *  call cannot catch it; only a surrounding try/catch in shutdown() does. Default `false` (tests
+   *  1-15 unchanged). Distinct from {@link abortReject} (async rejection). */
+  abortThrowSync = false;
   /** Opt-in (test 14): when `true`, `steer()` records then returns a promise that NEVER settles,
    *  so a fold stays pending forever. Exercises the BOUNDED deferred commit — the terminal commit
    *  must still fire (the macrotask boundary wins the race). Default `false` (tests 1-13 unchanged). */
@@ -152,6 +157,15 @@ class StubSession implements PeerSession {
   /** Captured reject fns for deferred steers (see {@link deferSteer}): `rejectSteer[i]()` rejects
    *  the i-th folded steer on demand. Empty unless `deferSteer` is set. */
   rejectSteer: (() => void)[] = [];
+  /** Opt-in (test #5, slow-accept): when `true`, `steer()` records then returns a promise that
+   *  resolves on `setTimeout(resolve, 5)` — a REAL ~5ms accept (a genuine settle doing work, e.g. a
+   *  future images-carrying steer's normalize/resize), long past the first microtask. 5ms is chosen
+   *  so the race is decided by DELAY MAGNITUDE, not timer-registration order: it LOSES to a 0ms
+   *  boundary (0 < 5 → timeout fires first → fold un-surfaced, finding #5) but WINS against a 50ms
+   *  human-scale boundary (5 < 50 → allSettled resolves first → fold acked). A `setTimeout(0)` accept
+   *  would be non-load-bearing here: registered at fold-time it always beats a later-registered 0ms
+   *  boundary, so it could never go red. Default `false` (tests 1-15 keep the microtask resolve). */
+  steerSlowAccept = false;
   private listeners: ((event: AgentSessionEvent) => void)[] = [];
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {
@@ -177,6 +191,16 @@ class StubSession implements PeerSession {
       this.rejectSteer.push(() => reject(new Error("steer rejected (deferred)")));
       return promise;
     }
+    // A real ~5ms accept (test #5, slow-accept): the steer resolves on setTimeout(resolve, 5) —
+    // genuine settle work, well past the first microtask. It loses to a 0ms boundary (finding #5's
+    // window) but wins against a 50ms human-scale boundary, so commitAfterSteers awaits and acks it.
+    // 5ms (a real delay, not setTimeout(0)) makes the race decided by magnitude, not registration
+    // order — the only shape that actually goes red when the timeout is reverted to 0.
+    if (this.steerSlowAccept) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 5);
+      return promise;
+    }
     // A non-async return so a rejected steer settles in ONE microtask (an `async` method would
     // adopt the thenable and take extra ticks) — the loop's `.catch → unsurface` then runs after
     // a single `await Promise.resolve()`, matching how the real session rejects.
@@ -184,6 +208,10 @@ class StubSession implements PeerSession {
   }
   abort(): Promise<void> {
     this.aborted++;
+    // A SYNCHRONOUS throw (test #6): the throw happens before any promise is returned, so a bare
+    // `.catch()` on the call never sees it — only shutdown()'s surrounding try/catch does. This is
+    // the seam a non-conforming adapter could hit; the per-call try/catch must still run dispose().
+    if (this.abortThrowSync) throw new Error("abort sync-throw");
     // A non-async return so a rejected abort settles in ONE microtask (mirrors `dispose`) — the
     // loop's `.catch(log)` then swallows it and `shutdown()` still proceeds to dispose()/resolve.
     return this.abortReject ? Promise.reject(new Error("abort rejected")) : Promise.resolve();
@@ -471,7 +499,7 @@ console.log("11) accepted steer is acked, not redelivered OK ✅");
   const session = new StubSession();
   session.deferSteer = true; // turn 1's fold steer stays pending until we fire rejectSteer[0]()
   mesh.items = [dm("a1", "alice", "q1")];
-  runPeerLoop({ mesh, session });
+  runPeerLoop({ mesh, session, steerSettleTimeoutMs: 0 }); // strand path: timeout must fire within one drain()
   session.emit(START); // turn 1 live
   mesh.arrive(dm("a2", "alice", "q2")); // fold a2 under generation g0; steer deferred (unsettled)
   session.emit(end("r1")); // pendingSteers non-empty → deferred commit races the macrotask boundary
@@ -529,7 +557,7 @@ console.log("13) shutdown blocks further dispatch (stopped-guard) OK ✅");
   const session = new StubSession();
   session.steerHang = true; // the fold's steer never resolves or rejects
   mesh.items = [dm("a1", "alice", "q1")];
-  runPeerLoop({ mesh, session });
+  runPeerLoop({ mesh, session, steerSettleTimeoutMs: 0 }); // never-settle path: timeout must fire within one drain()
   session.emit(START); // turn live, streaming
   mesh.arrive(dm("a2", "alice", "q2")); // fold a2; steer hangs → a2 stays pending forever
   session.emit(end("ans")); // pendingSteers non-empty → deferred commit races the boundary
@@ -575,5 +603,69 @@ console.log("14) strand safety: never-settling steer does not hang commit OK ✅
     "dispose STILL ran after the abort rejection → teardown continued so mesh.stop would run (no ghost peer)");
 }
 console.log("15) rejecting abort does not reject shutdown (dispose/mesh.stop still run) OK ✅");
+
+// 16) slow-accept steer is STILL acked under a human-scale timeout (#5-killer, load-bearing): the
+//     whole point of B-simple. A fold whose steer() accepts after a REAL settle delay (~5ms — genuine
+//     work, not just one microtask) must still be awaited by the deferred commit and acked, because a
+//     human-scale steerSettleTimeoutMs is generous enough to wait for it. commitAfterSteers races
+//     allSettled(pending) against setTimeout(steerSettleTimeoutMs); with a 50ms boundary the 5ms
+//     accept resolves first, so allSettled wins and a2 is acked. RED at boundary 0 (== the old
+//     setTimeout(0) window): 0 < 5, so the timeout fires before the accept settles → finishTurn
+//     un-surfaces a2 → acked==="a1", a2 redelivers (exactly finding #5). The delay is a REAL 5ms (not
+//     setTimeout(0)) so the race is decided by MAGNITUDE, not timer-registration order — the only
+//     shape that actually goes red at boundary 0. This test FAILS if someone reverts the timeout to a
+//     value below the accept delay (e.g. 0) or drops the param. Red-green evidence in the task report.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  session.steerSlowAccept = true; // the fold's steer resolves after a real ~5ms settle (setTimeout 5)
+  mesh.items = [dm("a1", "alice", "q1")];
+  runPeerLoop({ mesh, session, steerSettleTimeoutMs: 50 }); // human-scale boundary >> the 5ms accept
+  session.emit(START); // turn live, streaming
+  mesh.arrive(dm("a2", "alice", "q2")); // same scope → fold; slow-accept steer resolves ~5ms later
+  session.emit(end("ans")); // pendingSteers non-empty → deferred commit awaits the slow accept
+  // Wait past the slow accept's ~5ms delay but well UNDER the 50ms timeout, so the commit provably
+  // comes from allSettled resolving (a2 accepted), NOT from the timeout firing. A real delay (not
+  // drain()s): two macrotask ticks (~1ms) would assert before the 5ms accept and the deferred commit.
+  await new Promise((r) => setTimeout(r, 20));
+  assert(ids(mesh.acked) === "a1,a2",
+    "the slow-accepted fold a2 IS acked (allSettled waited for it); at timeout 0 acked==='a1' (#5)");
+  assert(!mesh.items.some((x) => x.id === "a2"),
+    "a2 left the stream (acked, not redelivered); at timeout 0 a2 stays → redelivers");
+  assert(session.steers.length === 1, "the slow fold attempted the steer exactly once");
+}
+console.log("16) slow-accept steer is still acked under a human-scale timeout (#5) OK ✅");
+
+// 17) a synchronously-throwing abort() must STILL resolve shutdown() and run dispose() (#6, the
+//     ghost-peer seam): a `.catch()` only handles a REJECTED promise; a SYNC throw before the promise
+//     is even returned escapes it — only a surrounding try/catch in shutdown() catches it. The
+//     per-call try/catch (abort in one block, dispose in its own) resolves shutdown despite the sync
+//     throw AND still runs dispose so peer.ts's mesh.stop() runs → no ghost peer. Mirrors test 15
+//     (async reject) with a SYNC throw instead. RED on /tmp/loop-bsimple-catchonly.ts (a `.catch`-only
+//     shutdown): the sync throw escapes `.catch` → shutdown throws → resolved=false, disposed=0.
+{
+  const mesh = new FakeMesh();
+  const session = new StubSession();
+  mesh.items = [dm("s1", "alice")];
+  session.abortThrowSync = true; // abort() increments then THROWS synchronously (before any promise)
+  const loop = runPeerLoop({ mesh, session });
+  // Hold the turn IN FLIGHT: emit START (streaming, turn open) with no agent_end, so shutdown() enters
+  // the `if (turn.inFlight)` branch and calls abort() — the only path where a sync-throwing abort matters.
+  session.emit(START);
+  await drain();
+  let resolved = false;
+  try {
+    await loop.shutdown();
+    resolved = true;
+  } catch {
+    resolved = false;
+  }
+  assert(resolved === true,
+    "loop.shutdown() RESOLVED despite the SYNC throw from abort (.catch-only shutdown → false)");
+  assert(session.aborted === 1, "abort was attempted exactly once (turn was in flight)");
+  assert(session.disposed === 1,
+    "dispose STILL ran after the sync throw → per-call try/catch let teardown continue (.catch-only → 0)");
+}
+console.log("17) sync-throwing abort still resolves shutdown and runs dispose (#6) OK ✅");
 
 console.log("OH-MY-PI PEER SMOKE OK ✅");

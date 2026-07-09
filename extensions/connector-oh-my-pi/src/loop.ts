@@ -95,7 +95,22 @@ function turnReplyText(messages: readonly unknown[]): string | undefined {
  * events rather than an `agent_end.willRetry` flag, so an `agent_end` here is always the
  * turn's terminal event.
  */
-export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSession }): PeerLoop {
+export function runPeerLoop({
+  mesh,
+  session,
+  // How long a terminal commit waits for a turn's unconfirmed fold steers to settle before giving
+  // up on them (un-surfacing → redeliver). A healthy steer settles in ≤1 microtask (its promise
+  // resolves at synchronous enqueue-time — no image work on the connector's string-only steers), so
+  // allSettled wins this race by orders of magnitude and the timeout never fires on the happy path;
+  // it only bounds a genuinely-stuck steer so shutdown/commit can't wedge. 5s is generous headroom
+  // over any realistic settle (even a future images-carrying steer's normalize/resize is ~tens of
+  // ms) while keeping a stuck-steer commit delay human-tolerable. Injectable so tests don't wait it.
+  steerSettleTimeoutMs = 5_000,
+}: {
+  mesh: PeerMesh;
+  session: PeerSession;
+  steerSettleTimeoutMs?: number;
+}): PeerLoop {
   const turn = new InboxTurn(mesh);
   let streaming = false; // gates steer(): only valid once the agent is actually streaming
   // Set once shutdown() begins so nothing dispatched after teardown drives a disposed session
@@ -194,15 +209,17 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
     pump(); // next scope
   }
 
-  /** agent_end path with folds still unconfirmed: wait — bounded by one macrotask so a steer that
-   *  never settles can't hang the turn — for each fold's steer to settle (its handler in
+  /** agent_end path with folds still unconfirmed: wait — bounded by {@link steerSettleTimeoutMs} so
+   *  a steer that never settles can't hang the turn — for each fold's steer to settle (its handler in
    *  {@link foldSameScope} acks an accepted fold by leaving it surfaced, un-surfaces a rejected one),
-   *  then finish. A fold STILL pending after the wait stranded → finishTurn un-surfaces it (redeliver,
-   *  the safe direction). Guarded so a shutdown mid-wait or a superseding turn never commits a
-   *  stale/disposed turn. */
+   *  then finish. The timeout is generous (a healthy steer settles in ≤1 microtask, so allSettled
+   *  wins the race with orders of magnitude to spare — even a slow accept lands well within it, so an
+   *  accepted fold is never falsely un-surfaced). A fold STILL pending after the timeout stranded →
+   *  finishTurn un-surfaces it (redeliver, the safe direction). Guarded so a shutdown mid-wait or a
+   *  superseding turn never commits a stale/disposed turn. */
   async function commitAfterSteers(gen: number, to: InboxItem | undefined, reply?: string): Promise<void> {
-    const boundary = new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await Promise.race([Promise.allSettled([...pendingSteers.values()]), boundary]);
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, steerSettleTimeoutMs));
+    await Promise.race([Promise.allSettled([...pendingSteers.values()]), timeout]);
     if (stopped || gen !== generation) return; // torn down or superseded mid-wait → don't commit
     finishTurn(to, reply);
   }
@@ -251,11 +268,24 @@ export function runPeerLoop({ mesh, session }: { mesh: PeerMesh; session: PeerSe
   return {
     async shutdown(): Promise<void> {
       stopped = true; // block any in-flight prompt/steer/mesh callback from driving a disposed session
-      if (turn.inFlight) {
-        turn.abandon(); // leave the in-flight run on the stream → redeliver, no peer dropped
-        await session.abort().catch(log); // a rejected abort must not skip dispose()/the caller's mesh.stop()
+      // abort() and dispose() are INDEPENDENT teardown steps: each must run even if the other fails,
+      // and neither may propagate out of shutdown() — peer.ts awaits this before mesh.stop(), so a
+      // throw here would skip mesh cleanup → ghost peer. Per-call try/catch (not one wrapping block:
+      // that would let an abort failure skip dispose) also covers a SYNCHRONOUS throw that a bare
+      // .catch() would miss (a non-conforming adapter throwing before it returns its promise).
+      try {
+        if (turn.inFlight) {
+          turn.abandon(); // leave the in-flight run on the stream → redeliver, no peer dropped
+          await session.abort();
+        }
+      } catch (e) {
+        log(e); // a failed abort must not skip dispose below
       }
-      await session.dispose().catch(log); // await async cleanup, but never let a dispose failure skip the caller's mesh.stop()
+      try {
+        await session.dispose(); // await async cleanup before the caller stops the mesh
+      } catch (e) {
+        log(e); // a failed dispose must not skip the caller's mesh.stop()
+      }
     },
   };
 }
