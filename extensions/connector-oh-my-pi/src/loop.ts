@@ -218,8 +218,18 @@ export function runPeerLoop({
    *  finishTurn un-surfaces it (redeliver, the safe direction). Guarded so a shutdown mid-wait or a
    *  superseding turn never commits a stale/disposed turn. */
   async function commitAfterSteers(gen: number, to: InboxItem | undefined, reply?: string): Promise<void> {
-    const timeout = new Promise<void>((resolve) => setTimeout(resolve, steerSettleTimeoutMs));
-    await Promise.race([Promise.allSettled([...pendingSteers.values()]), timeout]);
+    // Bound the wait on a human-scale timer, but CLEAR it when allSettled wins (the common path):
+    // an uncleared setTimeout(steerSettleTimeoutMs) stays ref'd on the Node event loop and delays
+    // process/CLI exit by up to that timeout per folded turn (harmless at 0ms, not at the 5s default).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, steerSettleTimeoutMs);
+      });
+      await Promise.race([Promise.allSettled([...pendingSteers.values()]), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
     if (stopped || gen !== generation) return; // torn down or superseded mid-wait → don't commit
     finishTurn(to, reply);
   }
