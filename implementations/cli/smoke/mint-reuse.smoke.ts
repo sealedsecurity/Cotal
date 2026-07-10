@@ -17,7 +17,7 @@
  */
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSpaceAuth, idFromCreds } from "@cotal-ai/core";
@@ -171,6 +171,49 @@ try {
     "mint --out <existing creds> --force overwrites with a fresh identity (escape hatch intact)",
     idFromCreds(readFileSync(victimCreds, "utf8")) !== victimIdBefore,
     { victimIdBefore, after: idFromCreds(readFileSync(victimCreds, "utf8")) },
+  );
+
+  // 8) Symlinked canonical creds path (greptile P1). `out === canonicalOut` is a STRING compare — it
+  //    does not prove the file at that path belongs to <name>. If creds/<name>.creds is a symlink to
+  //    another agent's creds, existsSync/readFileSync/writeSecretFile all FOLLOW it, so a plain
+  //    `cotal mint <name>` would read the target's id and write <name>'s ACLs back THROUGH the link,
+  //    clobbering the pointed-to agent. A creds file must be a real file at its own path: mint refuses
+  //    a symlinked out path (canonical or custom, with or without --force), leaving the target intact.
+  writeFileSync(join(agentsDir, "keeper.md"), "---\nname: keeper\nsubscribe: [general]\nallowSubscribe: [general]\n---\nbody\n");
+  writeFileSync(join(agentsDir, "decoy.md"), "---\nname: decoy\nsubscribe: [general]\nallowSubscribe: [general, ops]\n---\nbody\n");
+  const keeperCreds = join(credsDir, "keeper.creds");
+  await mintQuiet(["keeper"]);
+  const keeperBefore = readFileSync(keeperCreds, "utf8");
+  const keeperIdBefore = idFromCreds(keeperBefore);
+  symlinkSync(keeperCreds, join(credsDir, "decoy.creds")); // canonical decoy path → keeper's real creds
+  let symlinkMsg = "";
+  try {
+    await mintQuiet(["decoy"]); // canonical path, no --out, no --force
+  } catch (e) {
+    symlinkMsg = e instanceof Error ? e.message : String(e);
+  }
+  check(
+    "mint <name> whose canonical creds is a symlink fails loud (no read/write through the link)",
+    /symlink/.test(symlinkMsg),
+    { symlinkMsg },
+  );
+  check(
+    "refused symlink mint left the link target byte-identical (no clobber of the pointed-to agent)",
+    readFileSync(keeperCreds, "utf8") === keeperBefore && idFromCreds(readFileSync(keeperCreds, "utf8")) === keeperIdBefore,
+    { changed: readFileSync(keeperCreds, "utf8") !== keeperBefore },
+  );
+  // --force must NOT bypass the guard: rotating a fresh id straight through the link still clobbers the
+  // target. The escape hatch is to remove the link, never to write through it.
+  let symlinkForceMsg = "";
+  try {
+    await mintQuiet(["decoy", "--force"]);
+  } catch (e) {
+    symlinkForceMsg = e instanceof Error ? e.message : String(e);
+  }
+  check(
+    "mint --force does NOT write through a symlinked creds path (still refuses, target intact)",
+    /symlink/.test(symlinkForceMsg) && readFileSync(keeperCreds, "utf8") === keeperBefore,
+    { symlinkForceMsg, changed: readFileSync(keeperCreds, "utf8") !== keeperBefore },
   );
 } finally {
   process.chdir(prevCwd);

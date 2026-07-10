@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -98,6 +98,25 @@ export async function mint(argv: string[]): Promise<void> {
   // (a compromised key / intentional new identity).
   const canonicalOut = resolve(join(dir, "creds", `${name}.creds`));
   const out = resolve(values.out ?? canonicalOut);
+  // A creds file must be a REAL file at its own path. `out === canonicalOut` below is a string compare
+  // (resolve() normalizes the path but does NOT follow symlinks), so it cannot prove the file at the
+  // canonical path belongs to <name>. If creds/<name>.creds is a symlink, existsSync/readFileSync/
+  // writeSecretFile all FOLLOW it — mint would read the link target's id and write <name>'s ACLs back
+  // THROUGH the link, clobbering the pointed-to agent (and --force would rotate a fresh id straight
+  // through it). Refuse a symlinked out path outright — canonical or custom, with or without --force.
+  let outIsSymlink = false;
+  try {
+    outIsSymlink = lstatSync(out).isSymbolicLink(); // lstat does NOT follow the link (unlike existsSync)
+  } catch {
+    // ENOENT: nothing at `out`, not even a dangling link — not a symlink, leave false.
+  }
+  if (outIsSymlink) {
+    throw new Error(
+      `cotal mint: ${out} is a symlink — a creds file must be a real file at its own path, not a link ` +
+        `to another agent's creds (following it would read or overwrite the wrong identity). Remove the ` +
+        `symlink and mint to a real path.`,
+    );
+  }
   // The canonical `creds/<name>.creds` path is the ONLY binding between an agent name and a creds
   // file: the file bakes an nkey id, not the name (`identity.ts`), so a creds file at a custom
   // `--out` cannot be attributed to <name>. A custom `--out` onto an EXISTING creds file must
