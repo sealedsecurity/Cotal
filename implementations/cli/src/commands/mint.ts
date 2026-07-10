@@ -96,8 +96,23 @@ export async function mint(argv: string[]): Promise<void> {
   // lifetime across re-mints would be surprising — so they always rotate. Reuse only when: agent
   // profile, a creds file already exists here, and --force did not ask for deliberate rotation
   // (a compromised key / intentional new identity).
-  const out = resolve(values.out ?? join(dir, "creds", `${name}.creds`));
-  const reuse = profile === "agent" && !values.force && existsSync(out);
+  const canonicalOut = resolve(join(dir, "creds", `${name}.creds`));
+  const out = resolve(values.out ?? canonicalOut);
+  // The canonical `creds/<name>.creds` path is the ONLY binding between an agent name and a creds
+  // file: the file bakes an nkey id, not the name (`identity.ts`), so a creds file at a custom
+  // `--out` cannot be attributed to <name>. A custom `--out` onto an EXISTING creds file must
+  // therefore never be silently reused (re-signing another agent's id with this name's ACLs) nor
+  // overwritten (rotating that id, orphaning its id-keyed ACL row + dm/dlv durables) — fail loud
+  // unless --force asks for the overwrite deliberately. Identity reuse is thus canonical-path-only.
+  if (!values.force && out !== canonicalOut && existsSync(out)) {
+    throw new Error(
+      `cotal mint: --out ${out} already holds a creds file that may not belong to "${name}" — creds ` +
+        `identify an agent by nkey id, not by name, so this file cannot be safely reused or ` +
+        `overwritten for "${name}". Pass --force to overwrite it with a fresh identity, or point ` +
+        `--out at a path that does not exist yet.`,
+    );
+  }
+  const reuse = profile === "agent" && !values.force && out === canonicalOut && existsSync(out);
   let identity: Identity;
   if (reuse) {
     try {

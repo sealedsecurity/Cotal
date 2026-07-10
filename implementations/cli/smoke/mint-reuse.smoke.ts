@@ -137,6 +137,41 @@ try {
     readFileSync(corruptCreds, "utf8") === "",
     { content: readFileSync(corruptCreds, "utf8").slice(0, 40) },
   );
+
+  // 7) Cross-identity --out guard (greptile P1). Creds carry the nkey id, NOT the agent name, so the
+  //    only name↔identity binding is the canonical creds/<name>.creds path. Reuse is therefore
+  //    canonical-path-only: `cotal mint <name> --out <another agent's creds>` must never reuse (re-sign
+  //    that file's id with <name>'s ACLs) nor silently clobber it (overwrite its id, orphaning its
+  //    durables). Without --force it fails loud; --force is the deliberate-overwrite escape hatch.
+  writeFileSync(join(agentsDir, "victim.md"), "---\nname: victim\nsubscribe: [general]\nallowSubscribe: [general]\n---\nbody\n");
+  writeFileSync(join(agentsDir, "raider.md"), "---\nname: raider\nsubscribe: [general]\nallowSubscribe: [general, review, ops]\n---\nbody\n");
+  const victimCreds = join(credsDir, "victim.creds");
+  await mintQuiet(["victim"]);
+  const victimBefore = readFileSync(victimCreds, "utf8");
+  const victimIdBefore = idFromCreds(victimBefore);
+  let raiderMsg = "";
+  try {
+    await mintQuiet(["raider", "--out", victimCreds]);
+  } catch (e) {
+    raiderMsg = e instanceof Error ? e.message : String(e);
+  }
+  check(
+    "mint <name> --out <another agent's creds> fails loud naming --force (no cross-identity reuse)",
+    /--force/.test(raiderMsg) && /belong/.test(raiderMsg),
+    { raiderMsg },
+  );
+  check(
+    "refused cross-identity mint left the target creds byte-identical (no re-sign of its id, no clobber)",
+    readFileSync(victimCreds, "utf8") === victimBefore && idFromCreds(readFileSync(victimCreds, "utf8")) === victimIdBefore,
+    { changed: readFileSync(victimCreds, "utf8") !== victimBefore },
+  );
+  // --force is the explicit escape hatch: it rotates to a FRESH identity and overwrites the target.
+  await mintQuiet(["raider", "--out", victimCreds, "--force"]);
+  check(
+    "mint --out <existing creds> --force overwrites with a fresh identity (escape hatch intact)",
+    idFromCreds(readFileSync(victimCreds, "utf8")) !== victimIdBefore,
+    { victimIdBefore, after: idFromCreds(readFileSync(victimCreds, "utf8")) },
+  );
 } finally {
   process.chdir(prevCwd);
   rmSync(root, { recursive: true, force: true });
