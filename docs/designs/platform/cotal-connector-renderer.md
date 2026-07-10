@@ -29,9 +29,10 @@ Global Constraints — it is gated on PR #8's fork-base clearing).
 through the `sendMessage` `details` field (today discarded as `{}`), and register a
 `MessageRenderer` for the two custom types the loop emits (`cotal:incoming`,
 `cotal:nudge`). OMP stores `details` on the `CustomMessage` and hands the whole
-message to the renderer, which reads `message.details.items` and lays out one card
-per item (sender · role · kind/channel badge · mention/historical markers · text),
-mirroring OMP's own `CustomMessageComponent` frame. The `content` string (the
+message to the renderer, which **branches on `details.kind`**: an `incoming` message
+lays out one card per `details.items` entry (sender · role · kind/channel badge ·
+mention/historical markers · text), and a `nudge` renders a single compact line from
+`content` (it carries no items). Both mirror OMP's own `CustomMessageComponent` frame. The `content` string (the
 `formatInjection` blob) is retained unchanged as the no-renderer / non-TUI fallback
 and as the LLM-visible text — the renderer is display-only and never alters what the
 model reads.
@@ -83,14 +84,18 @@ Questions #2).
 4. Widen `PeerHost.sendMessage`'s `details` type from `unknown` to a structured
    `CotalInjectionDetails` payload, and export that type. Thread the real payload at
    the `drive()` call site: `details: { items, kind: override ? "nudge" : "incoming" }`
-   (in the nudge branch `items` is `[]` — the renderer handles the bare-string nudge
-   case distinctly).
-5. Implement a `MessageRenderer` (`renderCotalMessage`) that reads
-   `message.details.items` and returns a per-item card `Component` built from
-   `@oh-my-pi/pi-tui` `Box`/`Container` + OMP `theme`, mirroring
-   `CustomMessageComponent`. Handle: incoming (N item cards), nudge (single
-   compact line), and the empty/absent-details fallback (render nothing extra —
-   `content` already carries the text).
+   (in the nudge branch `items` is `[]` by design — the renderer keys on `kind`, not
+   `items` emptiness, so nudges still render; see step 5).
+5. Implement a `MessageRenderer` (`renderCotalMessage`) that **branches on
+   `message.details?.kind`**, not on `items` emptiness (nudge legitimately carries
+   `items: []`, so an emptiness check would wrongly send nudges to the fallback):
+   - `kind === "incoming"` → one card `Component` per `details.items` entry, built
+     from `@oh-my-pi/pi-tui` `Box`/`Container` + OMP `theme`, mirroring
+     `CustomMessageComponent`.
+   - `kind === "nudge"` → a single compact line rendered from `message.content` (the
+     nudge string; `items` is `[]` here by design).
+   - `details` absent/undefined (a non-cotal custom message) → return `undefined` so
+     OMP falls back to `content`. This is the only `undefined` case.
 6. Register it in `cotalMesh(pi)` for both custom types:
    `pi.registerMessageRenderer("cotal:incoming", renderCotalMessage)` and
    `pi.registerMessageRenderer("cotal:nudge", renderCotalMessage)`, using the exported
@@ -110,7 +115,7 @@ Questions #2).
 - [ ] **B1** — widen + export `CotalInjectionDetails`; thread real payload at the `drive()` call site.
   - `Interfaces:` produces `export interface CotalInjectionDetails { items: InboxItem[]; kind: "incoming" | "nudge" }` (`InboxItem` from `@cotal-ai/connector-core`, shape at `connector-core/src/agent.ts:44-64`). Changes `PeerHost.sendMessage` `message.details` from `unknown` → `CotalInjectionDetails` (`interactive-loop.ts:34-40`); call site `interactive-loop.ts:96-98` `details: {}` → `details: { items, kind: override ? "nudge" : "incoming" }`.
 - [ ] **B2** — implement `renderCotalMessage: MessageRenderer<CotalInjectionDetails>`.
-  - `Interfaces:` `MessageRenderer<T> = (message: CustomMessage<T>, options: MessageRenderOptions, theme: Theme) => Component | undefined` (`types.ts:905-909`); reads `message.details?.items` (`CustomMessage<T>.details?: T`, `session/messages.ts:467-472`). Builds `Component` via `Box`/`Container` from `@oh-my-pi/pi-tui` + `theme`, mirroring `CustomMessageComponent` (`src/modes/components/custom-message.ts`). Renders per-`InboxItem` card; returns `undefined` when `details?.items` is empty/absent (fallback to `content`).
+  - `Interfaces:` `MessageRenderer<T> = (message: CustomMessage<T>, options: MessageRenderOptions, theme: Theme) => Component | undefined` (`types.ts:905-909`); reads `message.details` (`CustomMessage<T>.details?: T`, `session/messages.ts:467-472`). **Branches on `details?.kind`**: `"incoming"` → per-`InboxItem` card built via `Box`/`Container` from `@oh-my-pi/pi-tui` + `theme`, mirroring `CustomMessageComponent` (`src/modes/components/custom-message.ts`); `"nudge"` → compact single line from `message.content` (`items` is `[]` by design, so it does NOT gate on `items.length`); `details` absent → `undefined` (fall back to `content`) — the sole `undefined` case.
 - [ ] **B3** — register the renderer for both custom types in `cotalMesh(pi)`.
   - `Interfaces:` `pi.registerMessageRenderer<CotalInjectionDetails>(customType, renderCotalMessage): void` (`types.ts:1077`); called in `cotalMesh(pi: ExtensionAPI)` (`extension.ts:41`) for `INCOMING` (`"cotal:incoming"`) and `NUDGE` (`"cotal:nudge"`) (`interactive-loop.ts:42-43`).
 - [ ] **B4** — smoke: `details` carries structured `items` on an incoming batch; renderer invoked.
