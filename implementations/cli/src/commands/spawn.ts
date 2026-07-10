@@ -179,7 +179,7 @@ export const spawnFlags = [
   { name: "file", type: "string", short: "f", value: "<cotal.yaml>", description: "deploy a manifest onto the running mesh" },
   { name: "dry-run", type: "boolean", description: "with -f: print the plan, mutate nothing" },
   { name: "allow-stale", type: "string", value: "<a,b>", description: "with -f: waive named stale agents (apply-only)" },
-  { name: "runtime", type: "string", value: "<pty|tmux|cmux>", description: "with -f: override the manifest's runtime" },
+  { name: "runtime", type: "string", value: "<pty|tmux|cmux|zellij>", description: "with -f: override the manifest's runtime" },
 ] as const satisfies readonly FlagSpec[];
 
 /** Comma-list flag → string[] (shared by both spawn modes). */

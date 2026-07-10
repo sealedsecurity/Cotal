@@ -216,11 +216,14 @@ export function newPane(
     : opts.floating
       ? ["--floating"]
       : ["--direction", opts.direction ?? "down"];
-  return execFileSync(
+  const id = execFileSync(
     "zellij",
     actionArgs(session, ["new-pane", ...shape, "--cwd", cwd, "--", ...argv]),
     { encoding: "utf8" },
   ).trim();
+  if (!/^terminal_\d+$/.test(id))
+    throw new Error(`zellij: couldn't read pane id from new-pane ("${id}")`);
+  return id;
 }
 
 /** Focus a tab by name, CREATING it if absent (`go-to-tab-name --create`). Subsequent `new-pane`
