@@ -82,11 +82,16 @@ it is not the fix; this design is.
   commits ACL rows for every agent defined in the persona dir (`.cotal/agents/*.md`, enumerated by
   `listPersonas`, `implementations/cli/src/lib/personas.ts:29-46`). Keeps mint offline-pure;
   bring-up becomes one command that also makes every agent non-blind from boot, with no per-agent
-  flag to remember. Trade-offs: both `cotal up` and the standalone `cotal provision-acl` enumerate
-  the persona dir via `listPersonas` (agent-files only — it never scans `creds/`), so an agent minted
-  out-of-band with **no persona file** is not covered by either path as specified — a known gap, not
-  a covered case. (Closing it would need a `creds/`-directory scan added to the routine; deferred as
-  an edge case — the mint+exec-omp recipe this design targets always writes a persona file.) Couples
+  flag to remember. Trade-off — **the enumeration source is load-bearing and, as specified, defeats
+  the target recipe (see OQ#2, from the design-critic pass):** both `cotal up` and the standalone
+  `cotal provision-acl` enumerate the persona dir via `listPersonas` (agent-files only — it never
+  scans `creds/`; `personas.ts:33` `readdirSync(dir).filter((f) => f.endsWith(".md"))`). But
+  `cotal mint <name> --profile agent` — the recipe this design targets — writes **only a creds file**,
+  no persona file (`mint.ts:82` merely *reads* `agentFilePath` if it exists; `mint.ts:88-92` writes
+  `creds/<name>.creds` and nothing else). So a plain-minted agent has no persona file and is invisible
+  to `listPersonas` → skipped by both paths → wake-blind: the exact bug this design fixes. This is not
+  the edge case an earlier draft deferred; it is the primary path, and OQ#2 raises enumerating
+  `creds/*.creds` as the fix.) Couples
   ACL provisioning to bring-up; and — the one wrinkle the fork glosses — a row
   is keyed by the agent's **id** (its nkey public key, `packages/core/src/identity.ts:12-17`), so
   provisioning an agent whose creds don't exist yet forces the step to mint them (see Task 2).
@@ -169,7 +174,17 @@ daemon-less meshes would accrete rows nothing authorizes or GCs.
 - **ACL value == minted `allowSubscribe`.** The row must equal the read set baked into the creds'
   `sub.allow` (rendered at `provision.ts:523` via `chatSubject(space, "*", ch)`), or durable read
   scope diverges from live read scope. Enforced structurally: one shared derivation helper feeds
-  both mint and provisioning, and pre-existing creds are cross-checked against their JWT (Task 2).
+  both mint and provisioning (Task 1), and pre-existing creds are cross-checked against their JWT
+  (Task 2). **Design-critic refinement (clear improvement):** the shared helper guarantees equality
+  only on the creds-**absent** path; on the creds-**exists** path the parity check compares a
+  rendered-subject set (`chatSubject`) against the JWT while the durable gate matches channel **names**
+  (`channelInAllow` over `subjectMatches`, `endpoint.ts:1646` / `subjects.ts:146-148`) — two different
+  matchers, so wildcard entries (`team.>`, `*`) are the seam where they can diverge. `assertValidChannel`
+  (`subjects.ts:103-120`) already forecloses the token-aliasing case, so this is defense-in-depth, not
+  an open hole; still, prefer deriving the committed ACL value **from the decoded JWT `sub.allow`**
+  (invert `chatSubject` → names) so the row is byte-derived from the same artifact that governs live
+  reads (parity by identity, not a cross-matcher set-compare), and add a wildcard-channel round-trip
+  case to Task 2's smoke.
 - **Write via core `commitAcl` only** (`acls.ts:59`, atomic CAS, idempotent, `[]`-vs-absent
   preserved). No hand-rolled KV puts.
 - **No new committed bash — TS only** (repo convention; tooling runs via `tsx`, Node >= 20, ESM).
@@ -182,8 +197,23 @@ daemon-less meshes would accrete rows nothing authorizes or GCs.
   as behavior (AGENTS.md). *One deliberate, scoped exception:* the `cotal up` auto-provision hook is
   non-fatal (see Recommendation) — `up` orchestrates many agents and one provisioning shortfall must
   not abort the whole bring-up, and the step is re-runnable. The **standalone** `cotal provision-acl`
-  stays hard-fail (exit 1) — a targeted command SHOULD fail loud. This mirrors the delivery daemon's
-  own at-`up` posture (`up.ts:284-285`), so it is a consistent convention, not a silent degrade.
+  stays hard-fail (exit 1) — a targeted command SHOULD fail loud. **Design-critic refinement (clear
+  improvement):** the daemon-soft-fail analogy is not exact — a daemon failure self-heals via
+  `reconcileBootJoin` when it recovers, but an ACL-provisioning shortfall does **not** self-heal (no
+  privileged writer ever fills the missing row, so `durableJoin` stays refused,
+  `endpoint.ts:1643-1645`), and a bare "log loudly" line in a long `up` transcript reproduces exactly
+  the invisibility of the motivating incident (0 rows unnoticed). So the hook must make residual
+  blindness **observable and actionable**, not merely logged: record the unprovisioned ids and surface
+  them on the existing delivery-health surface / `cotal status`, and/or have `up` exit non-zero if any
+  agent was left unprovisioned (it still comes up). Bare logging is not sufficient.
+- **Design-critic pass (SEA-1188).** This record went through one adversarial read-only critic pass
+  (2026-07-11). Two clear improvements are folded above (F4 — observable residual-blindness at the
+  `up` hook; F5 — derive the committed ACL from the decoded JWT + a wildcard round-trip test), and the
+  Task 3 lease-read grant is corrected (STREAM.INFO on the delivery bucket is already granted; only
+  MSG.GET was missing). Three code-grounded forks were surfaced as load-bearing Open Questions #2
+  (enumerate `creds/*.creds`, not persona files — the current source defeats the target recipe), #3
+  (reopens D1), and #4 (reopens D2). The record was already freeze-blocked on SEA-1168 (OQ#1); these
+  compound that block and must be resolved with it before freeze.
 
 ### Task 1 — shared read-policy derivation helper
 
@@ -261,10 +291,12 @@ already-started provisioner endpoint, and rewrite the stale `:244-248` comment t
 rationale (registry re-auth + `ctl.delivery` self-service; conditional purely on daemon presence).
 Refresh the two `provision.ts` docstrings (`:214-218`, `:244-245`) naming spawn as the canonical
 live-only example. Grant the provisioner profile read on the delivery lease bucket —
-`provisionerPermissions` (`provision.ts:860-909`) today grants only ACL + channel KV reads
-(`:893-902`), so add `$JS.API.STREAM.INFO.KV_<deliveryBucket>` +
-`$JS.API.STREAM.MSG.GET.KV_<deliveryBucket>` (read-only; mirrors the agent's own Component-6
-lease read, no escalation).
+`provisionerPermissions` (`provision.ts:860-909`) already grants `$JS.API.STREAM.INFO.KV_<deliveryBucket>`
+for every backing stream via `streamSetup` (`:867`, `:871-874`), and the ACL/channel read verbs at
+`:899-902` do **not** cover the delivery bucket — so add only the one genuinely-missing grant,
+`$JS.API.STREAM.MSG.GET.KV_<deliveryBucket>` (read-only; mirrors the agent's own Component-6 lease
+read, no escalation). (Do not re-add STREAM.INFO — it is already present; adding it is harmless
+over-spec.)
 
 - **Interfaces:** consumes
   `readDeliveryLease(shardIndex: number): Promise<DeliveryLeaseInfo | undefined>`
@@ -313,6 +345,12 @@ Ratified by Matt 2026-07-09 (asked directly, recommendations pre-selected). D1/D
 CLI-provisioning approach behaves; if SEA-1168 (see Open Questions) redirects the fix into core,
 revisit them under that record.
 
+> **Design-critic pass (SEA-1188, 2026-07-11) reopened D1 and D2 on new code evidence.** The
+> ratification text below is left exactly as Matt ratified it; the critic's challenges are surfaced
+> as load-bearing Open Questions #3 (D1 — lease-conditional strands spawn agents wake-blind on a
+> daemon-restart race) and #4 (D2 — `up`-minting orphans the id-keyed footprint on every normal
+> bring-up). Both await Matt's ruling; neither Decision is altered here.
+
 - **D1 — spawn provisions when a daemon is live (was OQ3).** `cotal spawn` replaces the
   unconditional `durableMembership: false` with auto-detect via the delivery lease
   (`durableMembership = readDeliveryLease(0) !== undefined`); no new flag. An explicit `--live-only`
@@ -346,3 +384,41 @@ no merge with an unresolved load-bearing open question).
    the fix lives in the CLI provisioning layer (this record) or in core (e.g. the delivery daemon
    self-provisions the row on first authorized contact, or the mint/JWT flow carries durable
    membership directly). Fold SEA-1168's outcome here as a Decision, then freeze.
+2. **[LOAD-BEARING — from design-critic pass] Enumerate `creds/*.creds`, not persona files?**
+   The Approach keys provisioning on `listPersonas` (`.cotal/agents/*.md`), but the target recipe
+   `cotal mint <name> --profile agent` writes only a creds file (`mint.ts:88-92`), no persona file —
+   so every plain-minted agent is invisible to both provisioning paths and stays wake-blind (the exact
+   bug this design fixes; verified: `personas.ts:33` filters `.md` only, `mint.ts:82` merely reads the
+   persona if present). The record's earlier deferral of this as an "edge case" is false against the
+   code; it is the primary path. **Fix (recommend):** enumerate `creds/*.creds` instead of (or in
+   union with) personas — `idFromCreds(creds)` (`identity.ts:33-44`) already yields the id, and the
+   read set is recoverable by decoding the JWT `sub.allow` (the same decode Task 2's parity path does),
+   so no persona file is needed to provision. This covers every minted agent by construction and matches
+   the id-keyed registry's natural key space. Materially changes Task 2's enumeration; needs Matt's call.
+3. **[LOAD-BEARING — from design-critic pass — REOPENS ratified D1] Conditional-on-lease vs
+   always-write the ACL row on spawn.** D1 ratified `durableMembership = readDeliveryLease(0) !==
+   undefined`. The critic surfaces, on code evidence, that this conditions a **persistent** privileged
+   row on a **transient** liveness signal: spawn's provisioner is short-lived (`await prov.stop()`
+   immediately after `provisionAgent`, `spawn.ts:257`), so a spawn whose probe races a daemon restart
+   (lease TTL-expired in the gap) reads `undefined`, writes no row, and exits — and nothing ever
+   backfills it (the agent can't self-authorize, `acls.ts:9-10`; `reconcileBootJoin` retries
+   durableJoin forever but the write never comes), leaving the agent **permanently** wake-blind. The
+   stated reason for rejecting always-write (avoid accreting rows on daemon-less meshes) is in tension
+   with D4, which already accepts absent-owner rows accreting DEFER-inert with GC deferred.
+   **Alternatives:** (a) always write the row on spawn (it is DEFER-inert and harmless on a daemon-less
+   mesh, `acls.ts:11-13`; the accretion cost is already accepted by D4); (b) if a live-only mode is
+   wanted, gate it on the explicit `--live-only` flag D1 already contemplates, not an inferred transient
+   read. This reopens a ratified Decision on new evidence — surfaced for Matt, D1 left as-ratified until he rules.
+4. **[LOAD-BEARING — from design-critic pass — REOPENS ratified D2] `cotal up` minting creds
+   orphans the footprint on every normal bring-up.** D2 ratified that `up` mints `creds/<name>.creds`
+   for persona-dir agents lacking them. The critic surfaces: every `cotal mint` makes a **fresh**
+   identity (`mint.ts:88` `newIdentity()`), and the footprint is id-keyed. So on the record's own
+   recipe (`cotal up` + per-agent `cotal mint`, Approach lines 105-107), if personas exist at up-time,
+   `up` mints id A and provisions A's full footprint; the operator's subsequent `cotal mint <name>`
+   then mints a **different** id B, overwriting `creds/<name>.creds` and orphaning A's dm_/dlv_/ACL —
+   promoting D4's "edge case" orphan to the common path on every bring-up, and `up` gains a
+   secret-writing side effect. **Alternatives:** (a) decouple identity-minting from bring-up — `up`
+   and `provision-acl` provision only creds that already exist (creds-absent → loud "run cotal mint
+   first"), keeping `cotal mint` the sole identity author; (b) if one-command fresh bring-up is a hard
+   requirement, make it idempotent-by-name (record the name→id binding so a later `cotal mint <same>`
+   is a no-op or a deliberate rotation). This reopens a ratified Decision on new evidence — surfaced for Matt, D2 left as-ratified until he rules.
