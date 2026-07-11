@@ -26,6 +26,13 @@
 // resolves to the specific .d.ts and typechecks clean. Revert to the root import once the upstream
 // type-build fix is published (see the header comment in src/peer.ts).
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+// TUI Component TYPE only (erased at build; no runtime import, so it never drags pi-tui's
+// Bun-coupled transitive graph — @oh-my-pi/pi-utils' barrel pulls `bun`, which the Node/tsx smoke
+// can't load). A `renderCall` returning a Component takes OMP's custom-renderer branch instead of
+// the generic animated-spinner fallback (the glyph artifact on cotal_* cards); we return a minimal
+// hand-rolled Component (just the required `render(width)`) rather than pi-tui's `Text`. See the
+// renderer helpers below.
+import type { Component } from "@oh-my-pi/pi-tui";
 import {
 	configFromEnv,
 	hasIdentity,
@@ -135,6 +142,60 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	);
 }
 
+/** One-line, human-readable summary of a cotal_* tool call, keyed by tool name and drawn from the
+ *  shared spec's args. Display-only (feeds `renderCall`); pure + exported for the smoke. Unknown
+ *  tools and absent args degrade to an empty summary (the label alone still leaves the spinner
+ *  fallback). Args are `unknown` because each tool's shape differs; we read defensively. */
+export function cotalCallSummary(name: string, args: unknown): string {
+	const a = (args ?? {}) as Record<string, unknown>;
+	const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+	const preview = (v: unknown, max = 60): string => {
+		const s = str(v).replace(/\s+/g, " ");
+		return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+	};
+	switch (name) {
+		case "cotal_send": {
+			const ch = str(a.channel) || "general";
+			const ment = Array.isArray(a.mentions) && a.mentions.length ? ` @${a.mentions.map(str).filter(Boolean).join(" @")}` : "";
+			const body = preview(a.text);
+			return `#${ch}${ment}${body ? ` — ${body}` : ""}`;
+		}
+		case "cotal_dm": {
+			const to = str(a.to) || "?";
+			const body = preview(a.text);
+			return `${to}${body ? ` — ${body}` : ""}`;
+		}
+		case "cotal_anycast": {
+			const role = str(a.role) || "?";
+			const body = preview(a.text);
+			return `@${role}${body ? ` — ${body}` : ""}`;
+		}
+		case "cotal_status": {
+			const parts = [str(a.status), str(a.attention)].filter(Boolean);
+			const act = preview(a.activity, 40);
+			return `${parts.join(" · ")}${act ? `${parts.length ? " · " : ""}${act}` : ""}`;
+		}
+		default:
+			return "";
+	}
+}
+
+/** Build the display-only Component for a cotal_* tool call: a titled single line (label + summary).
+ *  Returning a Component from `renderCall` is what takes OMP's custom-renderer branch instead of the
+ *  generic animated-spinner fallback — the whole point of wiring these hooks. Minimal by design: a
+ *  one-line renderer truncated to the render width. We hand-roll the Component (only `render(width)`
+ *  is required by the interface) instead of using pi-tui's `Text`, so no runtime pi-tui import is
+ *  pulled — that would drag @oh-my-pi/pi-utils' Bun-coupled barrel and break the Node/tsx smoke. */
+function renderCotalCall(label: string, summary: string): Component {
+	const line = summary ? `${label} — ${summary}` : label;
+	return {
+		render(width: number): readonly string[] {
+			const w = Number.isFinite(width) && width > 0 ? Math.floor(width) : line.length;
+			return [line.length > w ? (w >= 1 ? `${line.slice(0, w - 1)}…` : "") : line];
+		},
+	};
+}
+
 /** Render one shared CotalToolSpec onto `pi.registerTool`. `cotal_inbox` is forced read-only
  *  (peek): this extension delivers + acks each turn, so the agent's inbox tool must never drain,
  *  or it would race the ack. All others pass their args straight through to the spec's `run`. */
@@ -162,6 +223,7 @@ function registerSpec(
 				"Show the peer messages currently waiting for you (incl. focus-mode recall). You don't normally need this — the extension delivers peer messages into your turns automatically; use it to re-check what's pending mid-task. Read-only: it never consumes them.",
 			parameters,
 			approval: "read",
+			renderCall: () => renderCotalCall(spec.title, "peek inbox"),
 			async execute(_id, _params, _signal, _onUpdate, _ctx: ExtensionContext) {
 				return toResult(await spec.run(agent, config, { peek: true }));
 			},
@@ -178,6 +240,7 @@ function registerSpec(
 		label: spec.title,
 		description: spec.description,
 		parameters,
+		renderCall: (args) => renderCotalCall(spec.title, cotalCallSummary(spec.name, args)),
 		async execute(_id, params, _signal, _onUpdate, _ctx: ExtensionContext) {
 			return toResult(await spec.run(agent, config, params ?? {}));
 		},

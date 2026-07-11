@@ -26,6 +26,7 @@ interface RegisteredTool {
 	parameters: unknown;
 	approval?: string;
 	execute: (...a: unknown[]) => Promise<{ content: { type: string; text: string }[]; details: unknown }>;
+	renderCall?: (args: unknown, options?: unknown, theme?: unknown) => { render: (width: number) => readonly string[] };
 }
 
 /** A fake ExtensionAPI that records everything the factory does. */
@@ -96,6 +97,27 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	assert(inboxResult.content.length === 1, "cotal_inbox execute returns one content part");
 	assert(!inboxResult.content[0].text.startsWith("⚠"), "cotal_inbox execute does not error on empty inbox");
 	console.log("3) cotal_inbox read-only OK ✅");
+
+	// ---- 3b. every cotal_* tool carries a renderCall (spinner-fallback fix) ----
+	// A tool with no renderCall falls back to OMP's generic animated-spinner glyph. Asserting a
+	// renderCall on every registered tool is the regression guard for that artifact. Each must
+	// return a Component (a `render(width)` producing lines), not throw, for real and empty args.
+	for (const [name, tool] of tools) {
+		assert(typeof tool.renderCall === "function", `${name} carries a renderCall (no spinner fallback)`);
+		const comp = tool.renderCall!({}, {}, {});
+		assert(comp && typeof comp.render === "function", `${name} renderCall returns a Component`);
+		const lines = comp.render(80);
+		assert(Array.isArray(lines) && lines.some((l) => l.length > 0), `${name} renderCall renders a non-empty line`);
+	}
+	console.log(`   all ${tools.size} tools carry a renderCall`);
+
+	// The renderCall enriches the title with a per-surface summary drawn from args (not just the
+	// bare label): a cotal_dm to a peer shows the recipient; cotal_send shows the channel.
+	const dmLine = tools.get("cotal_dm")!.renderCall!({ to: "mercator", text: "ping" }, {}, {}).render(200).join(" ");
+	assert(dmLine.includes("mercator"), "cotal_dm renderCall shows the recipient");
+	const sendLine = tools.get("cotal_send")!.renderCall!({ channel: "svc.cotal", text: "hi" }, {}, {}).render(200).join(" ");
+	assert(sendLine.includes("svc.cotal"), "cotal_send renderCall shows the channel");
+	console.log("3b) tool renderCall present + enriched OK ✅");
 
 	// The factory started a MeshAgent with a background reconnect loop; fire session_shutdown to stop
 	// it so the smoke process can exit (no live mesh in this test).
