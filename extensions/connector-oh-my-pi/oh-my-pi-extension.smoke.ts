@@ -7,7 +7,7 @@
  * Asserts: inert without identity; with identity it registers the cotal_* tool surface, subscribes
  * to the lifecycle events, and cotal_inbox is read-only.
  */
-import cotalMesh from "./src/extension.ts";
+import cotalMesh, { cotalCallSummary } from "./src/extension.ts";
 import * as zodV4 from "zod/v4";
 import { MeshAgent } from "@cotal-ai/connector-core";
 import { setImmediate as settle } from "node:timers/promises";
@@ -118,6 +118,23 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	const sendLine = tools.get("cotal_send")!.renderCall!({ channel: "svc.cotal", text: "hi" }, {}, {}).render(200).join(" ");
 	assert(sendLine.includes("svc.cotal"), "cotal_send renderCall shows the channel");
 	console.log("3b) tool renderCall present + enriched OK ✅");
+
+	// ---- 3c. cotal_send card names the REAL destination + render clamps zero width ----
+	// cotalCallSummary is pure + exported. When `channel` is omitted, the card must show the
+	// destination the send actually resolves to — the caller's `defaultChannel`
+	// (config.subscribe.find(isConcreteChannel) ?? "general") — NOT a hardcoded "#general".
+	// Regression guard: the old renderer hardcoded "general", so an agent whose default channel
+	// was e.g. "svc.cotal" saw a card claiming "#general" while the message went to #svc.cotal.
+	const omittedCh = cotalCallSummary("cotal_send", { text: "hi" }, "svc.cotal");
+	assert(omittedCh.startsWith("#svc.cotal"), `omitted send channel shows the resolved default, not a guess (got: ${omittedCh})`);
+	assert(!omittedCh.includes("general"), "omitted send channel must not fabricate #general when the default differs");
+	const explicitCh = cotalCallSummary("cotal_send", { channel: "random", text: "hi" }, "svc.cotal");
+	assert(explicitCh.startsWith("#random"), "an explicit send channel still wins over the default");
+	// A zero-width render slot must yield a single empty line, never the untruncated title
+	// (the width-bounded render contract — OMP can hand a Component a zero-width slot).
+	const zeroWidth = tools.get("cotal_send")!.renderCall!({ channel: "svc.cotal", text: "hi" }, {}, {}).render(0);
+	assert(zeroWidth.length === 1 && zeroWidth[0] === "", `zero-width render returns [""], not an over-wide line (got: ${JSON.stringify(zeroWidth)})`);
+	console.log("3c) send card names real destination + zero-width clamp OK ✅");
 
 	// The factory started a MeshAgent with a background reconnect loop; fire session_shutdown to stop
 	// it so the smoke process can exit (no live mesh in this test).

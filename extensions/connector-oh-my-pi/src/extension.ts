@@ -42,7 +42,7 @@ import {
 	type ToolResult,
 	type MeshLogger,
 } from "@cotal-ai/connector-core";
-import type { PresenceStatus } from "@cotal-ai/core";
+import { isConcreteChannel, type PresenceStatus } from "@cotal-ai/core";
 import { runPeerLoop } from "./interactive-loop.js";
 
 export default function cotalMesh(pi: ExtensionAPI): void {
@@ -142,20 +142,30 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	);
 }
 
+/** Truncate to `max` display columns with a trailing ellipsis, collapsing internal whitespace to
+ *  single spaces first. Shared by the call summary and the render clamp so both handle the narrow
+ *  and zero/negative-width edges identically: `max <= 0` → empty, `max === 1` → just the ellipsis. */
+function truncate(s: string, max: number): string {
+	const flat = s.replace(/\s+/g, " ");
+	if (max <= 0) return "";
+	if (flat.length <= max) return flat;
+	return max === 1 ? "…" : `${flat.slice(0, max - 1)}…`;
+}
+
 /** One-line, human-readable summary of a cotal_* tool call, keyed by tool name and drawn from the
  *  shared spec's args. Display-only (feeds `renderCall`); pure + exported for the smoke. Unknown
  *  tools and absent args degrade to an empty summary (the label alone still leaves the spinner
- *  fallback). Args are `unknown` because each tool's shape differs; we read defensively. */
-export function cotalCallSummary(name: string, args: unknown): string {
+ *  fallback). Args are `unknown` because each tool's shape differs; we read defensively.
+ *  `defaultChannel` is the destination `cotal_send` resolves an omitted `channel` to — the caller
+ *  passes the SAME value the endpoint uses (`config.subscribe.find(isConcreteChannel) ?? "general"`,
+ *  mirrored from CotalEndpoint.multicast), so the card names the real target instead of a guess. */
+export function cotalCallSummary(name: string, args: unknown, defaultChannel: string): string {
 	const a = (args ?? {}) as Record<string, unknown>;
 	const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
-	const preview = (v: unknown, max = 60): string => {
-		const s = str(v).replace(/\s+/g, " ");
-		return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-	};
+	const preview = (v: unknown, max = 60): string => truncate(str(v), max);
 	switch (name) {
 		case "cotal_send": {
-			const ch = str(a.channel) || "general";
+			const ch = str(a.channel) || defaultChannel;
 			const ment = Array.isArray(a.mentions) && a.mentions.length ? ` @${a.mentions.map(str).filter(Boolean).join(" @")}` : "";
 			const body = preview(a.text);
 			return `#${ch}${ment}${body ? ` — ${body}` : ""}`;
@@ -185,13 +195,16 @@ export function cotalCallSummary(name: string, args: unknown): string {
  *  generic animated-spinner fallback — the whole point of wiring these hooks. Minimal by design: a
  *  one-line renderer truncated to the render width. We hand-roll the Component (only `render(width)`
  *  is required by the interface) instead of using pi-tui's `Text`, so no runtime pi-tui import is
- *  pulled — that would drag @oh-my-pi/pi-utils' Bun-coupled barrel and break the Node/tsx smoke. */
+ *  pulled — that would drag @oh-my-pi/pi-utils' Bun-coupled barrel and break the Node/tsx smoke.
+ *  A zero/negative or non-finite width yields a single empty line: OMP can hand a Component a
+ *  zero-width slot, and the width-bounded render contract must never return an over-wide line. */
 function renderCotalCall(label: string, summary: string): Component {
 	const line = summary ? `${label} — ${summary}` : label;
 	return {
 		render(width: number): readonly string[] {
-			const w = Number.isFinite(width) && width > 0 ? Math.floor(width) : line.length;
-			return [line.length > w ? (w >= 1 ? `${line.slice(0, w - 1)}…` : "") : line];
+			if (!Number.isFinite(width) || width <= 0) return [""];
+			const w = Math.floor(width);
+			return [line.length > w ? truncate(line, w) : line];
 		},
 	};
 }
@@ -210,6 +223,10 @@ function registerSpec(
 		content: [{ type: "text" as const, text: r.isError ? `⚠ ${r.text}` : r.text }],
 		details: {},
 	});
+
+	// The channel `cotal_send` resolves an omitted `channel` to — the same expression the endpoint
+	// uses (CotalEndpoint.multicast), so the tool card names the real destination, not a guess.
+	const defaultChannel = config.subscribe.find(isConcreteChannel) ?? "general";
 
 	if (spec.name === "cotal_inbox") {
 		// Empty params (this tool takes none). The explicit `registerTool<…>` generic below pins
@@ -240,7 +257,7 @@ function registerSpec(
 		label: spec.title,
 		description: spec.description,
 		parameters,
-		renderCall: (args) => renderCotalCall(spec.title, cotalCallSummary(spec.name, args)),
+		renderCall: (args) => renderCotalCall(spec.title, cotalCallSummary(spec.name, args, defaultChannel)),
 		async execute(_id, params, _signal, _onUpdate, _ctx: ExtensionContext) {
 			return toResult(await spec.run(agent, config, params ?? {}));
 		},
