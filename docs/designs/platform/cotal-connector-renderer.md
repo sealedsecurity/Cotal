@@ -111,8 +111,13 @@ Questions #2).
    - `customType === INCOMING` → one card `Component` per `details.items` entry. The
      card frame is OQ#4 (a returned Component is unframed — option (a) returns
      `undefined` after pre-formatting `content`; option (b) hand-builds a frame).
-   - `customType === NUDGE` → a single compact line rendered from `message.content`
-     (the nudge string; `items` is `[]` here by design).
+   - `customType === NUDGE` → a single compact line rendered from `message.content`.
+     For a nudge, `content` is the bare nudge **string** set on the `drive(override)`
+     path (`interactive-loop.ts:70` `text = override`; the sole caller is the focus
+     mention-recall at `:118`, a non-empty literal), NOT `formatInjection(items)` —
+     `formatInjection` runs only on the incoming branch (`:75`, inside the `else`). So
+     `content` is always present for a nudge and `items` is `[]` here by design; the
+     renderer never reads `items` on this branch.
    - `details` absent/undefined (a non-cotal custom message) → return `undefined` so
      OMP falls back to `content`. This is the only unconditional `undefined` case.
 6. Register it in `cotalMesh(pi)` for both custom types:
