@@ -99,10 +99,16 @@ Questions #2).
    `CotalInjectionDetails` payload, and export that type. Thread the real payload at
    the `drive()` call site: `details: { items }` (in the nudge/override branch `items`
    is `[]` — the renderer keys on `message.customType`, not `items` emptiness, so
-   nudges still render; see step 5). Also type the OMP-facing call as
-   `pi.sendMessage<CotalInjectionDetails>({...})` (the host method is generic —
-   `types.ts:1105`) so the payload is checked against `CustomMessagePayload<CotalInjectionDetails>`
-   rather than erased to `unknown` at the `pi` boundary.
+   nudges still render; see step 5). The loop's only send path is `host.sendMessage(...)`
+   where `host: PeerHost` — the connector's internal seam, satisfied by OMP's
+   `ExtensionAPI` and bound to `pi` at the factory (`extension.ts:99`,
+   `runPeerLoop({ mesh: agent, host: pi })`). Type safety comes from widening that
+   seam's `details` field, which checks the payload at the `host.sendMessage` call
+   site; `PeerHost` stays non-generic, so no `<CotalInjectionDetails>` type-arg is
+   written there. (OMP's underlying method is itself generic — `sendMessage<T>`,
+   `types.ts:1105` — which makes the typed `details` sound end-to-end; the type-arg
+   would appear only if `pi.sendMessage` were called directly, which the loop does
+   not do.)
 5. Implement a `MessageRenderer` (`renderCotalMessage`) that **branches on
    `message.customType`** (`INCOMING` vs `NUDGE`) — the value OMP already dispatched
    the renderer on, so it is authoritative and needs no separate `kind` field; it
@@ -113,9 +119,9 @@ Questions #2).
      `undefined` after pre-formatting `content`; option (b) hand-builds a frame).
    - `customType === NUDGE` → a single compact line rendered from `message.content`.
      For a nudge, `content` is the bare nudge **string** set on the `drive(override)`
-     path (`interactive-loop.ts:70` `text = override`; the sole caller is the focus
-     mention-recall at `:118`, a non-empty literal), NOT `formatInjection(items)` —
-     `formatInjection` runs only on the incoming branch (`:75`, inside the `else`). So
+     path (`interactive-loop.ts:74` `text = override`; the sole caller is the focus
+     mention-recall at `:127`, a non-empty literal), NOT `formatInjection(items)` —
+     `formatInjection` runs only on the incoming branch (the `else` at `:75`, call at `:79`). So
      `content` is always present for a nudge and `items` is `[]` here by design; the
      renderer never reads `items` on this branch.
    - `details` absent/undefined (a non-cotal custom message) → return `undefined` so
@@ -137,7 +143,7 @@ Questions #2).
 - [ ] **A3** — smoke assertion: registered `cotal_*` tools expose a `renderCall`.
   - `Interfaces:` extends `extensions/connector-oh-my-pi/*.smoke.ts`; asserts against the fake `pi` capturing `registerTool` options.
 - [ ] **B1** — widen + export `CotalInjectionDetails`; thread real payload at the `drive()` call site.
-  - `Interfaces:` produces `export interface CotalInjectionDetails { items: InboxItem[] }` (no `kind` field — the renderer keys on `customType`; `InboxItem` from `@cotal-ai/connector-core`, shape at `connector-core/src/agent.ts:44`). Changes `PeerHost.sendMessage` `message.details` from `unknown` → `CotalInjectionDetails` (`interactive-loop.ts:35-40`); call site `interactive-loop.ts:96-97` `details: {}` → `details: { items }`, and types the OMP-facing call `host.sendMessage<CotalInjectionDetails>(...)` (host method generic at `extensibility/extensions/types.ts:1105`) so the payload is checked, not erased to `unknown`.
+  - `Interfaces:` produces `export interface CotalInjectionDetails { items: InboxItem[] }` (no `kind` field — the renderer keys on `customType`; `InboxItem` from `@cotal-ai/connector-core`, shape at `connector-core/src/agent.ts:44`). Changes `PeerHost.sendMessage` `message.details` from `unknown` → `CotalInjectionDetails` (`interactive-loop.ts:35-40`); call site `interactive-loop.ts:96-97` `details: {}` → `details: { items }`. The seam stays non-generic — no `<CotalInjectionDetails>` type-arg at the `host.sendMessage` call; widening the `details` field is what checks the payload there (rather than erasing it to `unknown`). OMP's `ExtensionAPI.sendMessage<T>` is itself generic (`extensibility/extensions/types.ts:1105`), which keeps the typed `details` sound where `host` binds to `pi` (`extension.ts:99`).
 - [ ] **B2** — implement `renderCotalMessage: MessageRenderer<CotalInjectionDetails>`.
   - `Interfaces:` `MessageRenderer<T> = (message: CustomMessage<T>, options: MessageRenderOptions, theme: Theme) => Component | undefined` (`extensibility/extensions/types.ts:917-921`); reads `message.details` (`CustomMessage<T>.details?: T`, `session/messages.ts:556`) and `message.customType` (`session/messages.ts:554`). **Branches on `message.customType`**: `INCOMING` → per-`InboxItem` card `Component` (frame per OQ#4 — a returned Component is *not* wrapped in OMP's card by `renderFramedMessage` (`modes/components/message-frame.ts:50-56`); option (a) returns `undefined` after pre-formatting `content`, option (b) hand-builds the frame); `NUDGE` → compact single line from `message.content`; `details` absent → `undefined` (fall back to `content`) — the sole unconditional `undefined` case.
 - [ ] **B3** — register the renderer for both custom types in `cotalMesh(pi)`.
