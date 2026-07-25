@@ -7,6 +7,8 @@
  * untrusted input at load.
  */
 
+import type { Placement } from "./runtime.js";
+
 /** One agent's effective, resolved launch form. (`Mesh`-prefixed to avoid the connector's
  *  process-launch {@link LaunchSpec}/recipe — this is the deployment-manifest launch.) */
 export interface MeshLaunchAgent {
@@ -29,6 +31,9 @@ export interface MeshLaunchAgent {
   allowPublish: string[];
   /** Original persona path — for user-facing output only; never read for authority. */
   personaPath?: string;
+  /** Zellij pane placement (which tab + shape). Only the zellij runtime reads it; other runtimes
+   *  ignore it. Carried here so `supervise --launch` can place manifest agents into lane tabs. */
+  placement?: Placement;
   /** Content hash of the resolved launch fields (drift detection: a changed hash ⇒ restart-required). */
   hash: string;
 }

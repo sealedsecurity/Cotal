@@ -876,7 +876,9 @@ export class Manager {
         // (possibly per-agent) launch cwd below. The cwd itself rides runtime.spawn, not the launch.
         workspaceRoot: this.workspaceRoot,
       });
-      const handle = this.runtime.spawn(name, spec, cwd);
+      // Placement (which tab + pane shape) rides the resolved launch profile; only the zellij runtime
+      // reads it, other runtimes ignore it. Absent for imperative (non-manifest) spawns.
+      const handle = this.runtime.spawn(name, spec, cwd, opts.resolved?.placement);
       const managed: ManagedAgent = {
         name,
         role,

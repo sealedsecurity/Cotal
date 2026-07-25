@@ -44,11 +44,29 @@ export interface AgentHandle {
   attach(): AttachSession;
 }
 
+/** Where the zellij runtime places a spawned agent's pane. Optional everywhere — with no placement
+ *  (or no `tab`), `spawn` keeps its one-agent-one-tab default. Only the zellij backend reads this;
+ *  pty/tmux/cmux accept and ignore it, so a manifest carrying `placement` stays valid under any
+ *  backend. */
+export interface Placement {
+  /** Target tab by name; the tab is CREATED ON DEMAND if it doesn't exist. */
+  tab?: string;
+  /** Pane shape — `stacked`, `floating`, and `direction` are MUTUALLY EXCLUSIVE. The zellij driver
+   *  resolves them by priority (`stacked` > `floating` > `direction`), so setting more than one
+   *  silently drops the lower ones; the manifest/launch schemas reject that combination up front.
+   *  Stacked pane within the tab (the lane default). */
+  stacked?: boolean;
+  /** Floating pane. Exclusive with `stacked`/`direction` (see `stacked`). */
+  floating?: boolean;
+  /** Split direction when the pane is neither stacked nor floating. Exclusive with the other two. */
+  direction?: "right" | "down";
+}
+
 /** A pluggable agent backend — `pty` (default) owns a real pseudo-terminal; `tmux`
  *  drives a multiplexer pane; `cmux` (an integration) opens a tab. */
 export interface Runtime {
   readonly kind: RuntimeKind;
-  spawn(name: string, spec: LaunchSpec, cwd: string): AgentHandle;
+  spawn(name: string, spec: LaunchSpec, cwd: string, placement?: Placement): AgentHandle;
 }
 
 /**

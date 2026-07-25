@@ -172,6 +172,7 @@ function resolveAgents(
     capabilities: entry.capabilities,
     personaPermissions: entry.personaPermissions ?? topPolicy,
     policy: invertPolicy(name, channels),
+    placement: entry.placement,
   }));
 }
 

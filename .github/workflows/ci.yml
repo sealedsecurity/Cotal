@@ -104,6 +104,28 @@ jobs:
         run: echo "$HOME/nats-bin" >> "$GITHUB_PATH"
       - name: Install tmux
         run: tmux -V || (sudo apt-get update && sudo apt-get install -y tmux)
+      - name: Cache zellij
+        id: zellij
+        uses: actions/cache@v4
+        with:
+          path: ~/zellij-bin
+          key: zellij-v0.44.3-${{ runner.os }}
+      - name: Install zellij
+        if: steps.zellij.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ZELLIJ_VERSION=0.44.3
+          ZELLIJ_SHA256=0f7c346788627f506c0a28296517768633cff24fc822a739f8264b640ecad751
+          curl -fsSL -o /tmp/zellij.tar.gz \
+            "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz"
+          echo "${ZELLIJ_SHA256}  /tmp/zellij.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/zellij.tar.gz -C /tmp
+          mkdir -p ~/zellij-bin
+          install /tmp/zellij ~/zellij-bin/zellij
+      - name: zellij on PATH
+        run: |
+          echo "$HOME/zellij-bin" >> "$GITHUB_PATH"
+          "$HOME/zellij-bin/zellij" --version
       - name: Build
         run: pnpm build
       # Broker-free boundary/preflight guards + the live target-resolution / spawn-from-anywhere /
@@ -114,6 +136,12 @@ jobs:
         run: pnpm smoke:lifecycle-e2e
       - name: Runtime smoke tests (tmux)
         run: pnpm smoke:runtime
+
+      - name: Runtime smoke tests (zellij)
+        # Exercises the zellij Runtime end to end: pure layout-map (seedFromDump/generateKdl), and the
+        # live placement path (pane-into-named-tab, per-pane teardown) which needs an attached client —
+        # the smoke forks one under `script` (util-linux, present on the runner). zellij installed above.
+        run: pnpm smoke:zellij
       - name: cmux launcher secret-hygiene smoke
         run: pnpm smoke:cmux
       - name: OpenCode cooperative-stop smoke test

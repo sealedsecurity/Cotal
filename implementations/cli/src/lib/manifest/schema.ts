@@ -29,6 +29,33 @@ const AgentEntryObject = z
     capabilities: z.array(z.string().min(1)).optional(),
     /** Per-agent override of the top-level `personaPermissions` policy. */
     personaPermissions: PersonaPermissions.optional(),
+    /** Zellij placement: which tab this agent's pane lands in and its shape. Only the zellij runtime
+     *  reads it; other runtimes accept-and-ignore, so the manifest stays valid under any backend. */
+    placement: z
+      .strictObject({
+        tab: z
+          .string()
+          .min(1)
+          .refine((s) => !s.startsWith("-") && !/\p{Cc}/u.test(s), {
+            message: "placement.tab must not start with '-' and have no control chars",
+          })
+          .optional(),
+        stacked: z.boolean().optional(),
+        floating: z.boolean().optional(),
+        direction: z.enum(["right", "down"]).optional(),
+      })
+      // Shape is mutually exclusive (the zellij driver resolves stacked > floating > direction);
+      // reject >1 set at manifest-load rather than silently drop one at launch.
+      .refine(
+        (p) => [p.stacked === true, p.floating === true, p.direction !== undefined].filter(Boolean).length <= 1,
+        { message: "placement shape is exclusive: set at most one of stacked, floating, direction" },
+      )
+      // Reject an empty `placement: {}` — with no field set it's a no-op wrapper (falls back to the
+      // default per-agent-tab path), so require at least one field to carry real intent.
+      .refine((p) => p.tab !== undefined || p.stacked !== undefined || p.floating !== undefined || p.direction !== undefined, {
+        message: "placement must set at least one of tab, stacked, floating, direction (drop the empty wrapper)",
+      })
+      .optional(),
   })
   .refine((v) => v.persona !== undefined || v.model !== undefined || v.variant !== undefined || v.instructions !== undefined, {
     message:
@@ -73,7 +100,7 @@ export const MeshManifestSchema = z.strictObject({
   kind: z.literal("Mesh"),
   space: z.string().min(1),
   broker: Broker.optional(),
-  runtime: z.enum(["pty", "tmux", "cmux"]).optional(),
+  runtime: z.enum(["pty", "tmux", "cmux", "zellij"]).optional(),
   /** Default connector for agents that don't set their own `agent:`. */
   agent: z.string().min(1).optional(),
   personaPermissions: PersonaPermissions.optional(),

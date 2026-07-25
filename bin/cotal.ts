@@ -17,6 +17,7 @@ import "@cotal-ai/connector-opencode"; // registers the `opencode` connector (na
 import "@cotal-ai/connector-hermes"; // registers the `hermes` connector (Nous Research gateway as a mesh peer)
 import "@cotal-ai/cmux"; // opt into the cmux integration — registers the `cmux` runtime + TerminalLayout providers
 import "@cotal-ai/tmux"; // opt into the tmux integration — registers the `tmux` runtime + TerminalLayout providers
+import "@cotal-ai/zellij"; // opt into the zellij integration — registers the `zellij` runtime + TerminalLayout providers
 import { claudeConnector } from "@cotal-ai/connector-claude-code";
 import { registry } from "@cotal-ai/core";
 

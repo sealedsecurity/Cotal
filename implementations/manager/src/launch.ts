@@ -32,6 +32,35 @@ const LaunchAgentSchema = z.strictObject({
   allowSubscribe: z.array(z.string()),
   allowPublish: z.array(z.string()),
   personaPath: z.string().optional(),
+  // Placement is manifest-declared; this is the untrusted-input boundary. The tab name is passed as a
+  // STRUCTURAL argv token to `zellij action go-to-tab-name` (never a shell string), so zellij accepts
+  // arbitrary names (verified: slashes, spaces). Guard only against argv/control-char injection: a
+  // non-empty name that can't be mistaken for a flag (no leading `-`) and has no control characters.
+  placement: z
+    .strictObject({
+      tab: z
+        .string()
+        .min(1)
+        .refine((s) => !s.startsWith("-") && !/\p{Cc}/u.test(s), {
+          message: "placement.tab must be non-empty, not start with '-', and have no control chars",
+        })
+        .optional(),
+      stacked: z.boolean().optional(),
+      floating: z.boolean().optional(),
+      direction: z.enum(["right", "down"]).optional(),
+    })
+    // Shape is mutually exclusive: the zellij driver resolves stacked > floating > direction, so a
+    // combo like {stacked, floating} would silently drop one. Reject >1 set rather than pick quietly.
+    .refine(
+      (p) => [p.stacked === true, p.floating === true, p.direction !== undefined].filter(Boolean).length <= 1,
+      { message: "placement shape is exclusive: set at most one of stacked, floating, direction" },
+    )
+    // An empty `placement: {}` is a no-op wrapper (tab absent ⇒ default per-agent-tab path); require
+    // at least one field so the wrapper always carries intent rather than misleading the reader.
+    .refine((p) => p.tab !== undefined || p.stacked !== undefined || p.floating !== undefined || p.direction !== undefined, {
+      message: "placement must set at least one of tab, stacked, floating, direction (drop the empty wrapper)",
+    })
+    .optional(),
   hash: z.string().regex(/^[A-Za-z0-9]+$/, "hash must be alphanumeric"),
 });
 

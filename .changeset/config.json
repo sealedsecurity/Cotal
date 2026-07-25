@@ -12,6 +12,7 @@
       "@cotal-ai/delivery",
       "@cotal-ai/cmux",
       "@cotal-ai/tmux",
+      "@cotal-ai/zellij",
       "@cotal-ai/connector-core",
       "@cotal-ai/connector-claude-code",
       "@cotal-ai/connector-hermes",

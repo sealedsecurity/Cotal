@@ -87,6 +87,132 @@ channels:
   assert.equal(review.description, "Design critique.");
 }
 
+// --- runtime: zellij + per-agent placement (resolve → prepare) ---------------------------------
+{
+  const m = ok(`${HEAD}
+runtime: zellij
+agents:
+  supervisor:
+    model: opus
+    instructions: coordinate the wave
+    placement:
+      tab: supervisor
+  worker:
+    model: sonnet
+    instructions: do the work
+    placement:
+      tab: sealed
+      stacked: true
+channels:
+  general:
+    subscribe: [supervisor, worker]
+    allowPublish: [supervisor, worker]
+`);
+  // runtime carries through resolve.
+  assert.equal(m.runtime, "zellij");
+
+  const supervisor = m.agents.find((a) => a.name === "supervisor")!;
+  const worker = m.agents.find((a) => a.name === "worker")!;
+  // per-agent placement resolved verbatim.
+  assert.deepEqual(supervisor.placement, { tab: "supervisor" });
+  assert.deepEqual(worker.placement, { tab: "sealed", stacked: true });
+
+  // placement survives prepare → PreparedAgent (the launch-form projection).
+  const { prepared } = prepareAgent(worker, undefined, new Set(["general"]));
+  assert.deepEqual(prepared.placement, { tab: "sealed", stacked: true });
+}
+
+// an agent with no placement resolves to undefined (backwards-compatible; other runtimes ignore it).
+{
+  const m = ok(`${HEAD}
+agents:
+  solo:
+    model: opus
+    instructions: x
+channels:
+  general:
+    subscribe: [solo]
+    allowPublish: [solo]
+`);
+  assert.equal(m.runtime, undefined);
+  assert.equal(m.agents.find((a) => a.name === "solo")!.placement, undefined);
+}
+
+// unknown key inside placement (strict) → rejected.
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement:
+      tab: t
+      bogus: true
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "Unrecognized key");
+
+// placement shape is exclusive: >1 of stacked/floating/direction → rejected.
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement:
+      tab: t
+      stacked: true
+      floating: true
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "exclusive");
+
+// empty `placement: {}` is a no-op wrapper → rejected (must carry at least one field).
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement: {}
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "at least one");
+
+// placement.tab starting with '-' (flag-injection) → rejected (mirrors the launch-boundary guard).
+fails(`${HEAD}
+runtime: zellij
+agents:
+  a:
+    model: opus
+    instructions: x
+    placement:
+      tab: "-rf"
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "control chars");
+
+// unknown runtime value → rejected (enum lock).
+fails(`${HEAD}
+runtime: screen
+agents:
+  a:
+    model: opus
+    instructions: x
+channels:
+  general:
+    subscribe: [a]
+    allowPublish: [a]
+`, "Invalid option");
+
 // --- per-agent personaPermissions override -----------------------------------------------------
 {
   const m = ok(`${HEAD}personaPermissions: include

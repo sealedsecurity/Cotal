@@ -84,6 +84,9 @@ importers:
       '@cotal-ai/workspace':
         specifier: workspace:*
         version: link:../packages/workspace
+      '@cotal-ai/zellij':
+        specifier: workspace:*
+        version: link:../extensions/zellij
 
   examples/01-lateral-coordination:
     dependencies:
@@ -216,6 +219,12 @@ importers:
         version: 4.22.4
 
   extensions/tmux:
+    dependencies:
+      '@cotal-ai/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+
+  extensions/zellij:
     dependencies:
       '@cotal-ai/core':
         specifier: workspace:*
