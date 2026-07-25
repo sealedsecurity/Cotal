@@ -20,6 +20,9 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json",
+    "smoke:inbox": "tsx inbox-turn.smoke.ts",
+    "smoke:reconnect-log": "tsx smoke/reconnect-log.smoke.ts",
+    "test": "pnpm run smoke:inbox && pnpm run smoke:reconnect-log",
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
