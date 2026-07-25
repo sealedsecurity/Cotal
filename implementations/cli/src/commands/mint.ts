@@ -1,14 +1,16 @@
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { parseArgs } from "node:util";
 import {
   agentFilePath,
+  identityFromCreds,
   loadAgentFile,
   mintCreds,
   mkSecretDir,
   newIdentity,
   stripSpaceAuth,
   writeSecretFile,
+  type Identity,
   type Profile,
 } from "@cotal-ai/core";
 import { authDir, loadSpaceAuth } from "@cotal-ai/workspace";
@@ -28,7 +30,7 @@ export async function mint(argv: string[]): Promise<void> {
       profile: { type: "string" },
       out: { type: "string" },
       signer: { type: "boolean" }, // emit a stripped signer file instead of agent/observer creds
-      force: { type: "boolean" }, // (--signer) overwrite an existing signer file
+      force: { type: "boolean" }, // overwrite an existing --signer file; or (agent) rotate to a fresh id instead of reusing the existing creds'
       "allow-subscribe": { type: "string" }, // read ACL override (comma-separated)
       "allow-publish": { type: "string" }, // post ACL override (comma-separated)
     },
@@ -85,12 +87,72 @@ export async function mint(argv: string[]): Promise<void> {
     allowPublish = splitList(values["allow-publish"]) ?? def?.allowPublish;
     role = def?.role;
   }
-  const identity = newIdentity();
+  // Re-mint reuses the SAME identity by default — but only for the `agent` profile. mint's read/post
+  // ACLs come from the persona file, so re-minting is how an agent's channels get refreshed; and the
+  // mesh id, its durable ACL row, and its dm/dlv durables are all keyed by the nkey public key, so
+  // rotating the id on every mint (the old behavior) orphaned that row + those durables, leaving the
+  // agent @mention-wake-blind until re-provisioned. Observer/admin creds carry no persona-refresh
+  // workflow and no durable footprint to orphan, and silently extending a privileged admin key's
+  // lifetime across re-mints would be surprising — so they always rotate. Reuse only when: agent
+  // profile, a creds file already exists here, and --force did not ask for deliberate rotation
+  // (a compromised key / intentional new identity).
+  const canonicalOut = resolve(join(dir, "creds", `${name}.creds`));
+  const out = resolve(values.out ?? canonicalOut);
+  // A creds file must be a REAL file at its own path. `out === canonicalOut` below is a string compare
+  // (resolve() normalizes the path but does NOT follow symlinks), so it cannot prove the file at the
+  // canonical path belongs to <name>. If creds/<name>.creds is a symlink, existsSync/readFileSync/
+  // writeSecretFile all FOLLOW it — mint would read the link target's id and write <name>'s ACLs back
+  // THROUGH the link, clobbering the pointed-to agent (and --force would rotate a fresh id straight
+  // through it). Refuse a symlinked out path outright — canonical or custom, with or without --force.
+  let outIsSymlink = false;
+  try {
+    outIsSymlink = lstatSync(out).isSymbolicLink(); // lstat does NOT follow the link (unlike existsSync)
+  } catch {
+    // ENOENT: nothing at `out`, not even a dangling link — not a symlink, leave false.
+  }
+  if (outIsSymlink) {
+    throw new Error(
+      `cotal mint: ${out} is a symlink — a creds file must be a real file at its own path, not a link ` +
+        `to another agent's creds (following it would read or overwrite the wrong identity). Remove the ` +
+        `symlink and mint to a real path.`,
+    );
+  }
+  // The canonical `creds/<name>.creds` path is the ONLY binding between an agent name and a creds
+  // file: the file bakes an nkey id, not the name (`identity.ts`), so a creds file at a custom
+  // `--out` cannot be attributed to <name>. A custom `--out` onto an EXISTING creds file must
+  // therefore never be silently reused (re-signing another agent's id with this name's ACLs) nor
+  // overwritten (rotating that id, orphaning its id-keyed ACL row + dm/dlv durables) — fail loud
+  // unless --force asks for the overwrite deliberately. Identity reuse is thus canonical-path-only.
+  if (!values.force && out !== canonicalOut && existsSync(out)) {
+    throw new Error(
+      `cotal mint: --out ${out} already holds a creds file that may not belong to "${name}" — creds ` +
+        `identify an agent by nkey id, not by name, so this file cannot be safely reused or ` +
+        `overwritten for "${name}". Pass --force to overwrite it with a fresh identity, or point ` +
+        `--out at a path that does not exist yet.`,
+    );
+  }
+  const reuse = profile === "agent" && !values.force && out === canonicalOut && existsSync(out);
+  let identity: Identity;
+  if (reuse) {
+    try {
+      identity = identityFromCreds(readFileSync(out, "utf8"));
+    } catch (e) {
+      // A present-but-unreadable creds file (empty, truncated, or not a user creds file) must fail
+      // loud, not silently rotate — silently minting a fresh id here would orphan the durable row
+      // the existing id may still own. Point the operator at the deliberate-rotation escape hatch.
+      throw new Error(
+        `cotal mint: creds already exist at ${out} but could not be parsed to reuse the identity ` +
+          `(${e instanceof Error ? e.message : String(e)}). Pass --force to mint a fresh identity ` +
+          `(rotates the id), or remove the file if it is stale.`,
+      );
+    }
+  } else {
+    identity = newIdentity();
+  }
   const creds = await mintCreds(auth, identity, profile, { allowSubscribe, allowPublish, role });
-  const out = resolve(values.out ?? join(dir, "creds", `${name}.creds`));
   mkSecretDir(dirname(out));
   writeSecretFile(out, creds);
   console.log(c.green(`✓ minted ${profile} creds for "${name}"`));
-  console.log(c.dim(`  id:    ${identity.id}`));
+  console.log(c.dim(`  id:    ${identity.id}${reuse ? " (reused — re-mint kept the identity)" : " (new)"}`));
   console.log(c.dim(`  creds: ${out}`));
 }

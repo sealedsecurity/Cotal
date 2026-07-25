@@ -42,3 +42,15 @@ export function idFromCreds(creds: string): string {
   if (sub && sub !== id) throw new Error(`creds: seed identity ${id} != JWT subject ${sub}`);
   return id;
 }
+
+/** The full identity (id + seed) carried by a creds file — the id-preserving sibling of
+ *  {@link idFromCreds}. Re-mint reads this to RE-SIGN the SAME identity (stable id) with refreshed
+ *  ACLs instead of rotating to a fresh nkey, so the agent's durable ACL row and dm/dlv durables (all
+ *  keyed by id) stay valid across a re-mint. `idFromCreds` supplies the id AND its JWT-subject
+ *  cross-check (a spliced seed+JWT throws there); the seed is the same block it validates, returned
+ *  raw for {@link mintCreds} to re-embed. */
+export function identityFromCreds(creds: string): Identity {
+  const seedM = creds.match(/BEGIN USER NKEY SEED-----\s*([\s\S]*?)\s*------END USER NKEY SEED/);
+  if (!seedM) throw new Error("creds: no user nkey seed block found");
+  return { id: idFromCreds(creds), seed: seedM[1].trim() };
+}
