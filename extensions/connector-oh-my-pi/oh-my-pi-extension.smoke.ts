@@ -10,6 +10,7 @@
 import cotalMesh from "./src/extension.ts";
 import * as zodV4 from "zod/v4";
 import { MeshAgent } from "@cotal-ai/connector-core";
+import { setImmediate as settle } from "node:timers/promises";
 
 function assert(cond: unknown, msg: string): asserts cond {
 	if (!cond) {
@@ -28,10 +29,11 @@ interface RegisteredTool {
 }
 
 /** A fake ExtensionAPI that records everything the factory does. */
-function fakePi() {
+function fakePi(opts?: { rejectSessionName?: boolean }) {
 	const tools = new Map<string, RegisteredTool>();
 	const events = new Map<string, (e: unknown) => unknown>();
 	const sent: { message: Record<string, unknown>; options: Record<string, unknown> }[] = [];
+	const sessionNameSets: string[] = [];
 	const z = zodV4.z;
 	const pi = {
 		zod: zodV4,
@@ -42,8 +44,17 @@ function fakePi() {
 			sent.push({ message, options }),
 		registerCommand: () => {},
 		setLabel: () => {},
+		// The title fix calls `await pi.setSessionName(config.name)`. Record every name it sets so we
+		// can assert on WHAT was set (and how many times); `rejectSessionName` models a host that
+		// refuses the rename, exercising the best-effort catch in session_start.
+		setSessionName: (name: string) => {
+			sessionNameSets.push(name);
+			return opts?.rejectSessionName
+				? Promise.reject(new Error("smoke: setSessionName rejected"))
+				: Promise.resolve();
+		},
 	};
-	return { pi, tools, events, sent, z };
+	return { pi, tools, events, sent, sessionNameSets, z };
 }
 
 // ---- 1. inert without identity ------------------------------------------------
@@ -100,32 +111,100 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 // Each branch loads a fresh factory: the `started` guard is per-instance, so one instance can't be
 // re-driven. Env from block 2 (COTAL_NAME/COTAL_SERVERS) is still set → identity is present.
 {
+	// The title fix makes session_start `async` and, on an interactive session, name the session
+	// after the mesh identity via `ctx.sessionManager.getSessionName()` / `pi.setSessionName()`, so
+	// the ctx now carries a sessionManager. One shape for every sub-case below.
+	type SessionStart = (
+		event: unknown,
+		ctx: { hasUI: boolean; sessionManager: { getSessionName: () => string | undefined } },
+	) => unknown | Promise<unknown>;
 	const origStart = MeshAgent.prototype.start;
 	let startCalls = 0;
 	MeshAgent.prototype.start = function () {
 		startCalls++;
 	};
 	try {
-		// (a) non-interactive session (subagent/print/RPC): hasUI:false → stays off the mesh.
+		// (a) non-interactive session (subagent/print/RPC): hasUI:false → stays off the mesh AND does
+		//     no title work (behavior #3: a subagent must never rename the parent's session).
 		{
-			const { pi, events } = fakePi();
+			const { pi, events, sessionNameSets } = fakePi();
 			cotalMesh(pi as never);
-			const sessionStart = events.get("session_start") as
-				| ((event: unknown, ctx: { hasUI: boolean }) => unknown)
-				| undefined;
+			const sessionStart = events.get("session_start") as SessionStart | undefined;
 			assert(sessionStart, "identity → subscribes to session_start");
 			startCalls = 0;
-			await sessionStart(undefined, { hasUI: false });
+			await sessionStart(undefined, { hasUI: false, sessionManager: { getSessionName: () => undefined } });
 			assert(startCalls === 0, "hasUI:false → agent.start NOT invoked (subagent stays off mesh)");
+			assert(sessionNameSets.length === 0, "hasUI:false → setSessionName NOT called (no title work off the mesh)");
 		}
-		// (b) interactive top-level session: hasUI:true → joins the mesh.
+		// (b) interactive top-level session, unnamed: hasUI:true + getSessionName() undefined → joins
+		//     the mesh AND names the session after the mesh identity (behavior #1: title IS set when
+		//     unset; the arg must be config.name == COTAL_NAME == "smoke-peer" from block 2's env).
 		{
-			const { pi, events } = fakePi();
+			const { pi, events, sessionNameSets } = fakePi();
 			cotalMesh(pi as never);
-			const sessionStart = events.get("session_start") as (event: unknown, ctx: { hasUI: boolean }) => unknown;
+			const sessionStart = events.get("session_start") as SessionStart;
 			startCalls = 0;
-			await sessionStart(undefined, { hasUI: true });
+			await sessionStart(undefined, { hasUI: true, sessionManager: { getSessionName: () => undefined } });
+			await settle(); // the title work is now a detached fire-and-forget IIFE — let it settle before asserting sessionNameSets
 			assert(startCalls === 1, "hasUI:true → agent.start invoked (interactive session joins)");
+			assert(
+				sessionNameSets.length === 1 && sessionNameSets[0] === "smoke-peer",
+				`hasUI:true + unnamed → setSessionName called once with "smoke-peer" (got ${JSON.stringify(sessionNameSets)})`,
+			);
+		}
+		// (c) interactive session already named (resumed / manual `/rename`, source:"user"): hasUI:true
+		//     + getSessionName() returns a non-empty name → the guard suppresses the rename (behavior
+		//     #2: an existing title is NEVER clobbered), yet the mesh-join still proceeds.
+		{
+			const { pi, events, sessionNameSets } = fakePi();
+			cotalMesh(pi as never);
+			const sessionStart = events.get("session_start") as SessionStart;
+			startCalls = 0;
+			await sessionStart(undefined, { hasUI: true, sessionManager: { getSessionName: () => "user-renamed" } });
+			await settle(); // detached title IIFE: flush the microtask queue before asserting the (suppressed) rename
+			assert(sessionNameSets.length === 0, "hasUI:true + already named → setSessionName NEVER called (guard protects /rename + resume)");
+			assert(startCalls === 1, "hasUI:true + already named → agent.start still invoked (join unaffected by the guard)");
+		}
+		// (d) best-effort: setSessionName rejects (host refuses the rename). session_start must still
+		//     resolve and agent.start must still fire (behavior #4: a title failure must never break
+		//     the mesh-join). The rename is attempted exactly once before the failure is swallowed.
+		{
+			const { pi, events, sessionNameSets } = fakePi({ rejectSessionName: true });
+			cotalMesh(pi as never);
+			const sessionStart = events.get("session_start") as SessionStart;
+			startCalls = 0;
+			await sessionStart(undefined, { hasUI: true, sessionManager: { getSessionName: () => undefined } });
+			await settle(); // detached title IIFE: flush before asserting the attempted-then-swallowed rename
+			assert(sessionNameSets.length === 1 && sessionNameSets[0] === "smoke-peer", "setSessionName rejects → rename attempted exactly once");
+			assert(startCalls === 1, "setSessionName rejects → agent.start still invoked (best-effort: title failure never breaks the join)");
+		}
+		// (e) P1 regression: getSessionName() THROWS (session manager not ready). The cosmetic rename
+		//     must NEVER gate the mesh-join. With the fix, agent.start() fires FIRST and the guard read
+		//     lives INSIDE the detached IIFE's try, so the throw is swallowed there and can't reach the
+		//     handler — the join proceeds regardless (this is the exact both-bots P1: a not-ready
+		//     session manager once left the pane off the mesh).
+		{
+			const { pi, events, sessionNameSets } = fakePi();
+			cotalMesh(pi as never);
+			const sessionStart = events.get("session_start") as SessionStart;
+			startCalls = 0;
+			let handlerThrew = false;
+			try {
+				await sessionStart(undefined, {
+					hasUI: true,
+					sessionManager: {
+						getSessionName: () => {
+							throw new Error("session manager not ready");
+						},
+					},
+				});
+			} catch {
+				handlerThrew = true;
+			}
+			await settle(); // let the detached IIFE run (its try/catch swallows the getSessionName throw)
+			assert(!handlerThrew, "getSessionName throws → session_start still resolves (throw confined to the detached IIFE)");
+			assert(startCalls === 1, "getSessionName throws → agent.start STILL invoked (the crux: a not-ready session manager never gates the join)");
+			assert(sessionNameSets.length === 0, "getSessionName throws → setSessionName NEVER called (the guard read threw before any rename)");
 		}
 	} finally {
 		MeshAgent.prototype.start = origStart;

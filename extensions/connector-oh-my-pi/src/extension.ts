@@ -68,14 +68,32 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	// NOTE: a future headless launcher (e.g. Compass spawning a real worker) is also hasUI:false and
 	// WOULD need to join — revisit with an explicit signal (agentKind/env opt-in) when that lands.
 	let started = false;
-	pi.on("session_start", (_event, ctx: ExtensionContext) => {
+	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		if (started) return;
 		started = true;
 		if (!ctx.hasUI) {
 			log("non-interactive session (subagent/print/RPC) — staying off the mesh");
 			return;
 		}
+		// Start the mesh join FIRST — it's a non-blocking background connect with retry. The session
+		// naming below is cosmetic and must never gate the join: a `getSessionName()` throw (session
+		// manager not ready) or a `setSessionName()` promise that stalls instead of rejecting would
+		// otherwise leave the pane off the mesh. So connect, then name in fire-and-forget.
 		agent.start(); // background connect with retry — never blocks
+		// Name the session after the mesh identity so the terminal/pane title reflects WHO this agent
+		// is (COTAL_NAME) instead of a generic auto-title — the launcher forwards the name but OMP has
+		// no other agent-reachable way to set it (`/rename` isn't agent-invokable, the auto-title never
+		// fired). Connector-side, not an OMP→Cotal dependency. Guarded on an unset name so a resumed
+		// session or a manual `/rename` (both source:"user") is never clobbered; best-effort — a title
+		// failure (reject OR a getSessionName throw) must never break the join, so the whole path is
+		// detached and fully guarded.
+		void (async () => {
+			try {
+				if (!ctx.sessionManager.getSessionName()) await pi.setSessionName(config.name);
+			} catch (e) {
+				log(`could not set session name to "${config.name}": ${e instanceof Error ? e.message : String(e)}`, "warn");
+			}
+		})();
 	});
 
 	const loop = runPeerLoop({ mesh: agent, host: pi });
