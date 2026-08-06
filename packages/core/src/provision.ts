@@ -564,11 +564,15 @@ function permissionsFor(
     // Presence: watch (read, public roster) + flow control + PUT OWN KEY ONLY.
     `$JS.API.CONSUMER.CREATE.${KV}.>`,
     `$JS.API.CONSUMER.INFO.${KV}.>`,
-    // Delete OWN ephemeral kv.watch ordered consumer on reconnect/stop (SEA-1821): the watch
-    // iterator's consumer is library-named (nuid) and created by this agent, so a `.>` delete
-    // grant lets it reclaim only its own watch consumers — it cannot touch peers' (KV records stay
-    // protected by the own-key-only `$KV.<bucket>.<id>` grant below). Without this the leaked
-    // ordered consumers pile up unbounded and peg the broker (fleet-fatal).
+    // Delete an ephemeral kv.watch ordered consumer on reconnect/stop (SEA-1821). `.>` is the minimal
+    // EXPRESSIBLE scope: NATS can't owner-scope a consumer name, so the grant nominally covers ANY
+    // consumer on this KV stream. Peer isolation instead rests on two things: the agent has NO
+    // CONSUMER.LIST/NAMES grant (it can't enumerate consumers) and watch-consumer names are
+    // unguessable library nuids — so it can only delete a name it created itself. It's symmetric with
+    // the CREATE.>/INFO.> grants just above (same shape, same stream). KV *records* stay protected
+    // separately by the own-key-only `$KV.<bucket>.<id>` grant below. Without this delete grant the
+    // leaked ordered consumers pile up unbounded in auth mode (the delete is server-refused) and peg
+    // the broker — fleet-fatal.
     `$JS.API.CONSUMER.DELETE.${KV}.>`,
     "$JS.FC.>",
     `$KV.${presenceBucket(space)}.${id}`, // own presence key only — can't spoof peers
@@ -577,9 +581,9 @@ function permissionsFor(
     `$JS.API.STREAM.MSG.GET.${CHKV}`,
     `$JS.API.CONSUMER.CREATE.${CHKV}.>`,
     `$JS.API.CONSUMER.INFO.${CHKV}.>`,
-    // Delete OWN ephemeral kv.watch ordered consumer on reconnect/stop (SEA-1821) — same rationale
-    // as the presence-KV delete above: library-named, self-created, `.>`-scoped to this stream, and
-    // channel records stay privileged-write default-deny. Reclaims the channel watcher's consumer.
+    // Delete an ephemeral kv.watch ordered consumer on reconnect/stop (SEA-1821) — same rationale as
+    // the presence-KV delete above: `.>` is the minimal expressible scope, peer isolation rests on
+    // no-LIST/NAMES + unguessable nuid names, and channel records stay privileged-write default-deny.
     `$JS.API.CONSUMER.DELETE.${CHKV}.>`,
     // Delivery lease/readiness: READ-ONLY (kv.get) for the non-gating `cotal_channels` delivery-health
     // surface (Component 6). The lease key is daemon-availability info, like the world-readable roster;

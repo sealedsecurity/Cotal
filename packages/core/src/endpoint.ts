@@ -159,6 +159,13 @@ export interface EndpointOptions {
   ackWaitMs?: number;
   /** Retire this instance's durable consumers after it's been gone this long (ms). */
   inactiveThresholdMs?: number;
+  /** Override nats.js's own reconnect budget for this endpoint's connection. Left unset, nats.js
+   *  defaults apply (10 attempts × 2s ≈ 20s of downtime before it gives up and the connection closes
+   *  for good, which is what arms the endpoint's own self-heal rebuild). A caller that wants a faster
+   *  terminal close (a short-lived endpoint, or a test driving the self-heal path deterministically)
+   *  can shrink the budget; `maxReconnectAttempts: 0` disables nats.js reconnect entirely so any drop
+   *  goes straight to the self-heal rebuild. */
+  reconnect?: { maxReconnectAttempts?: number; reconnectTimeWaitMs?: number };
 }
 
 /** A peer subscribed to a channel — broker truth (a chat-stream consumer) joined with
@@ -212,6 +219,7 @@ export class CotalEndpoint extends EventEmitter {
   private readonly doConsume: boolean;
   private readonly ackWaitMs: number;
   private readonly inactiveThresholdMs: number;
+  private readonly reconnectOpts?: { maxReconnectAttempts?: number; reconnectTimeWaitMs?: number };
 
   private nc?: NatsConnection;
   private js?: JetStreamClient;
@@ -350,6 +358,7 @@ export class CotalEndpoint extends EventEmitter {
     this.channelModes = opts.channelModes && Object.keys(opts.channelModes).length ? opts.channelModes : undefined;
     this.ackWaitMs = opts.ackWaitMs ?? 60_000;
     this.inactiveThresholdMs = opts.inactiveThresholdMs ?? 600_000;
+    this.reconnectOpts = opts.reconnect;
   }
 
   ref(): EndpointRef {
@@ -380,6 +389,10 @@ export class CotalEndpoint extends EventEmitter {
       // (auth mode) it stops a peer from subscribing the wildcard inbox to sniff others'
       // DM deliveries. Set unconditionally so the prefix can never drift from the ACL.
       inboxPrefix: `_INBOX_${this.card.id}`,
+      // Override nats.js's reconnect budget only when the caller asked; else its defaults (10×2s)
+      // stand. A shrunk budget makes the connection close for good sooner, arming the self-heal path.
+      ...(this.reconnectOpts?.maxReconnectAttempts !== undefined ? { maxReconnectAttempts: this.reconnectOpts.maxReconnectAttempts } : {}),
+      ...(this.reconnectOpts?.reconnectTimeWaitMs !== undefined ? { reconnectTimeWait: this.reconnectOpts.reconnectTimeWaitMs } : {}),
       ...authOpts({ token: this.token, user: this.user, pass: this.pass, creds: this.creds, tls: this.tls }),
     });
     this.watchStatus();
@@ -1166,7 +1179,7 @@ export class CotalEndpoint extends EventEmitter {
     // One teardown convention for every KV watcher: stop the iterator AND delete its server-side
     // ordered consumer (see {@link stopWatch}). Caller-owned, not reconnect-scoped, so it doesn't
     // leak per-reconnect — but this reclaims its consumer immediately on close instead of aging out.
-    return { stop: () => this.stopWatch(iter as QueuedIterator<KvWatchEntry>) };
+    return { stop: () => this.stopWatch(iter) };
   }
 
   /** Fetch recent messages from a channel's JetStream backlog. */
