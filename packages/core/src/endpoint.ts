@@ -218,12 +218,13 @@ export class CotalEndpoint extends EventEmitter {
   private jsm?: JetStreamManager;
   private kv?: KV;
   private channelKv?: KV;
-  /** The presence + channel-registry KV watch iterators, held so a reconnect can stop them.
-   *  Each `kv.watch()` backs an ephemeral ordered JetStream consumer plus a delivery subscription
-   *  that `nc.drain()` does NOT reclaim — the delivery sub rides a dynamic inbox that is not in the
-   *  connection's tracked-subscription set, so drain/close skip it. Without an explicit `.stop()`
-   *  on rebind, every reconnect abandons the old iterator and leaks its consumer (and the socket it
-   *  keeps alive), unbounded. Torn down in {@link clearConnectionScoped}; re-armed by connectAndBind. */
+  /** The presence + channel-registry KV watch iterators, held so a reconnect can tear them down.
+   *  Each `kv.watch()` backs an ephemeral ordered JetStream consumer. `nc.drain()` closes the
+   *  client delivery sub but never sends `CONSUMER.DELETE` — the ordered consumer is independent
+   *  server-side JetStream state that survives client disconnect until its ~5-min
+   *  `inactive_threshold`. Without teardown on rebind, every reconnect abandons the old iterator and
+   *  its consumer piles up, unbounded. Torn down in {@link clearConnectionScoped} (stop + delete);
+   *  re-armed by connectAndBind. */
   private presenceWatch?: QueuedIterator<KvWatchEntry>;
   private channelWatch?: QueuedIterator<KvWatchEntry>;
   /** Plane-3 durable-membership registry KV — lazily opened by the privileged delivery daemon (or a
@@ -450,13 +451,19 @@ export class CotalEndpoint extends EventEmitter {
       this.sweepTimer = undefined;
     }
     // Tear down the presence + channel KV watch iterators. Each backs an ephemeral ordered JetStream
-    // consumer whose delivery subscription rides a dynamic inbox NOT in the connection's tracked-sub
-    // set — so `nc.drain()` never reclaims it, and `iter.stop()` only unsubscribes the client side
-    // (the server consumer then lingers for its 5-min inactive_threshold). Reconnects arrive far
-    // faster than that, so without an explicit delete each tick leaks a consumer (+ its socket),
-    // unbounded — the fleet-fatal leak (SEA-1821). Stop the iterator AND delete the server consumer.
-    void this.stopWatch(this.presenceWatch);
-    void this.stopWatch(this.channelWatch);
+    // consumer that is independent server-side JetStream state: `nc.drain()` closes the client
+    // delivery sub but never sends `CONSUMER.DELETE`, and `iter.stop()` only unsubscribes the client
+    // — so the server consumer lingers for its ~5-min inactive_threshold. Reconnects arrive far
+    // faster than that, so without teardown each tick leaks a consumer, unbounded — the fleet-fatal
+    // leak (SEA-1821). stopWatch stops the iterator AND deletes the server consumer. Note: the delete
+    // publishes on the OLD connection, so it lands only while that connection is still alive (the
+    // manual reconnect() → doRebuild path, which drains after this teardown). On the self-heal path
+    // (superviseConnection's nc.closed(), i.e. nats.js exhausted its own reconnects) the old nc is
+    // already dead, so the delete no-ops and the stopped consumer ages out over inactive_threshold —
+    // a bounded residual, not the unbounded leak. stopWatch is synchronous (the delete is
+    // fire-and-forget inside it), so nulling the fields immediately below is safe.
+    this.stopWatch(this.presenceWatch);
+    this.stopWatch(this.channelWatch);
     this.presenceWatch = undefined;
     this.channelWatch = undefined;
     for (const msgs of this.streamMsgs) {
@@ -634,6 +641,12 @@ export class CotalEndpoint extends EventEmitter {
     this.kickBackoff();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    // Reclaim the presence + channel watch consumers on a clean stop too (symmetry with the reconnect
+    // path): the connection is still live here — drain happens below — so stopWatch's delete lands.
+    this.stopWatch(this.presenceWatch);
+    this.stopWatch(this.channelWatch);
+    this.presenceWatch = undefined;
+    this.channelWatch = undefined;
     for (const msgs of this.streamMsgs) {
       try {
         msgs.stop();
@@ -1150,7 +1163,10 @@ export class CotalEndpoint extends EventEmitter {
     void (async () => {
       for await (const _ of iter) onChange();
     })().catch((err) => this.emit("error", err as Error));
-    return { stop: () => iter.stop() };
+    // One teardown convention for every KV watcher: stop the iterator AND delete its server-side
+    // ordered consumer (see {@link stopWatch}). Caller-owned, not reconnect-scoped, so it doesn't
+    // leak per-reconnect — but this reclaims its consumer immediately on close instead of aging out.
+    return { stop: () => this.stopWatch(iter as QueuedIterator<KvWatchEntry>) };
   }
 
   /** Fetch recent messages from a channel's JetStream backlog. */
