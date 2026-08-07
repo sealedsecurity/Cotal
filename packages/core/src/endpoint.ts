@@ -12,6 +12,7 @@ import {
   RequestError,
   type NatsConnection,
   type Subscription,
+  type QueuedIterator,
 } from "@nats-io/transport-node";
 import { idFromCreds } from "./identity.js";
 import { assertValidName } from "./resolve.js";
@@ -27,7 +28,7 @@ import {
   type ConsumerInfo,
   type JsMsg,
 } from "@nats-io/jetstream";
-import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
+import { Kvm, type KV, type KvEntry, type KvWatchEntry } from "@nats-io/kv";
 
 import type {
   AgentCard,
@@ -158,6 +159,13 @@ export interface EndpointOptions {
   ackWaitMs?: number;
   /** Retire this instance's durable consumers after it's been gone this long (ms). */
   inactiveThresholdMs?: number;
+  /** Override nats.js's own reconnect budget for this endpoint's connection. Left unset, nats.js
+   *  defaults apply (10 attempts × 2s ≈ 20s of downtime before it gives up and the connection closes
+   *  for good, which is what arms the endpoint's own self-heal rebuild). A caller that wants a faster
+   *  terminal close (a short-lived endpoint, or a test driving the self-heal path deterministically)
+   *  can shrink the budget; `maxReconnectAttempts: 0` disables nats.js reconnect entirely so any drop
+   *  goes straight to the self-heal rebuild. */
+  reconnect?: { maxReconnectAttempts?: number; reconnectTimeWaitMs?: number };
 }
 
 /** A peer subscribed to a channel — broker truth (a chat-stream consumer) joined with
@@ -211,12 +219,22 @@ export class CotalEndpoint extends EventEmitter {
   private readonly doConsume: boolean;
   private readonly ackWaitMs: number;
   private readonly inactiveThresholdMs: number;
+  private readonly reconnectOpts?: { maxReconnectAttempts?: number; reconnectTimeWaitMs?: number };
 
   private nc?: NatsConnection;
   private js?: JetStreamClient;
   private jsm?: JetStreamManager;
   private kv?: KV;
   private channelKv?: KV;
+  /** The presence + channel-registry KV watch iterators, held so a reconnect can tear them down.
+   *  Each `kv.watch()` backs an ephemeral ordered JetStream consumer. `nc.drain()` closes the
+   *  client delivery sub but never sends `CONSUMER.DELETE` — the ordered consumer is independent
+   *  server-side JetStream state that survives client disconnect until its ~5-min
+   *  `inactive_threshold`. Without teardown on rebind, every reconnect abandons the old iterator and
+   *  its consumer piles up, unbounded. Torn down in {@link clearConnectionScoped} (stop + delete);
+   *  re-armed by connectAndBind. */
+  private presenceWatch?: QueuedIterator<KvWatchEntry>;
+  private channelWatch?: QueuedIterator<KvWatchEntry>;
   /** Plane-3 durable-membership registry KV — lazily opened by the privileged delivery daemon (or a
    *  short-lived provisioner). */
   private membersKv?: KV;
@@ -340,6 +358,7 @@ export class CotalEndpoint extends EventEmitter {
     this.channelModes = opts.channelModes && Object.keys(opts.channelModes).length ? opts.channelModes : undefined;
     this.ackWaitMs = opts.ackWaitMs ?? 60_000;
     this.inactiveThresholdMs = opts.inactiveThresholdMs ?? 600_000;
+    this.reconnectOpts = opts.reconnect;
   }
 
   ref(): EndpointRef {
@@ -370,6 +389,10 @@ export class CotalEndpoint extends EventEmitter {
       // (auth mode) it stops a peer from subscribing the wildcard inbox to sniff others'
       // DM deliveries. Set unconditionally so the prefix can never drift from the ACL.
       inboxPrefix: `_INBOX_${this.card.id}`,
+      // Override nats.js's reconnect budget only when the caller asked; else its defaults (10×2s)
+      // stand. A shrunk budget makes the connection close for good sooner, arming the self-heal path.
+      ...(this.reconnectOpts?.maxReconnectAttempts !== undefined ? { maxReconnectAttempts: this.reconnectOpts.maxReconnectAttempts } : {}),
+      ...(this.reconnectOpts?.reconnectTimeWaitMs !== undefined ? { reconnectTimeWait: this.reconnectOpts.reconnectTimeWaitMs } : {}),
       ...authOpts({ token: this.token, user: this.user, pass: this.pass, creds: this.creds, tls: this.tls }),
     });
     this.watchStatus();
@@ -440,6 +463,22 @@ export class CotalEndpoint extends EventEmitter {
       clearInterval(this.sweepTimer);
       this.sweepTimer = undefined;
     }
+    // Tear down the presence + channel KV watch iterators. Each backs an ephemeral ordered JetStream
+    // consumer that is independent server-side JetStream state: `nc.drain()` closes the client
+    // delivery sub but never sends `CONSUMER.DELETE`, and `iter.stop()` only unsubscribes the client
+    // — so the server consumer lingers for its ~5-min inactive_threshold. Reconnects arrive far
+    // faster than that, so without teardown each tick leaks a consumer, unbounded — the fleet-fatal
+    // leak (SEA-1821). stopWatch stops the iterator AND deletes the server consumer. Note: the delete
+    // publishes on the OLD connection, so it lands only while that connection is still alive (the
+    // manual reconnect() → doRebuild path, which drains after this teardown). On the self-heal path
+    // (superviseConnection's nc.closed(), i.e. nats.js exhausted its own reconnects) the old nc is
+    // already dead, so the delete no-ops and the stopped consumer ages out over inactive_threshold —
+    // a bounded residual, not the unbounded leak. stopWatch is synchronous (the delete is
+    // fire-and-forget inside it), so nulling the fields immediately below is safe.
+    this.stopWatch(this.presenceWatch);
+    this.stopWatch(this.channelWatch);
+    this.presenceWatch = undefined;
+    this.channelWatch = undefined;
     for (const msgs of this.streamMsgs) {
       try {
         msgs.stop();
@@ -615,6 +654,12 @@ export class CotalEndpoint extends EventEmitter {
     this.kickBackoff();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    // Reclaim the presence + channel watch consumers on a clean stop too (symmetry with the reconnect
+    // path): the connection is still live here — drain happens below — so stopWatch's delete lands.
+    this.stopWatch(this.presenceWatch);
+    this.stopWatch(this.channelWatch);
+    this.presenceWatch = undefined;
+    this.channelWatch = undefined;
     for (const msgs of this.streamMsgs) {
       try {
         msgs.stop();
@@ -1131,7 +1176,10 @@ export class CotalEndpoint extends EventEmitter {
     void (async () => {
       for await (const _ of iter) onChange();
     })().catch((err) => this.emit("error", err as Error));
-    return { stop: () => iter.stop() };
+    // One teardown convention for every KV watcher: stop the iterator AND delete its server-side
+    // ordered consumer (see {@link stopWatch}). Caller-owned, not reconnect-scoped, so it doesn't
+    // leak per-reconnect — but this reclaims its consumer immediately on close instead of aging out.
+    return { stop: () => this.stopWatch(iter) };
   }
 
   /** Fetch recent messages from a channel's JetStream backlog. */
@@ -2468,6 +2516,7 @@ export class CotalEndpoint extends EventEmitter {
   private async startPresenceWatch(): Promise<void> {
     if (!this.kv) return;
     const iter = await this.kv.watch();
+    this.presenceWatch = iter;
     void (async () => {
       for await (const e of iter) this.handleKvEntry(e);
     })().catch((e) => this.emit("error", e as Error));
@@ -2479,9 +2528,37 @@ export class CotalEndpoint extends EventEmitter {
   private async startChannelWatch(): Promise<void> {
     if (!this.channelKv) return;
     const iter = await this.channelKv.watch();
+    this.channelWatch = iter;
     void (async () => {
       for await (const e of iter) this.handleChannelEntry(e);
     })().catch((e) => this.emit("error", e as Error));
+  }
+
+  /** Stop a KV watch iterator AND delete its server-side ephemeral ordered consumer. `iter.stop()`
+   *  alone only unsubscribes the client delivery sub; the consumer then survives its full
+   *  `inactive_threshold` (~5 min), and reconnects arrive faster than that, so the consumers pile up
+   *  (SEA-1821). `@nats-io/kv` stashes the ordered PushConsumer on the iterator's `_data` slot
+   *  (documented "for use by extenders"); deleting it reclaims the server resource immediately.
+   *  Best-effort: a drained connection or an already-gone consumer just throws and is ignored. */
+  private stopWatch(iter: QueuedIterator<KvWatchEntry> | undefined): void {
+    if (!iter) return;
+    try {
+      iter.stop();
+    } catch {
+      /* already closed with the connection */
+    }
+    // `@nats-io/kv`'s watch() stashes the ordered PushConsumer on the QueuedIterator's `_data` slot
+    // (public field on the impl, documented "for use by extenders", but absent from the exported
+    // QueuedIterator<T> type — so the shape is genuinely unexpressible without a cast). Name the cast
+    // and narrow before calling: iter.stop() only unsubscribes the client, leaving the ephemeral
+    // consumer to age out over its ~5-min inactive_threshold; an explicit delete reclaims it now.
+    const withData = iter as QueuedIterator<KvWatchEntry> & { _data?: unknown };
+    const consumer = withData._data;
+    if (consumer && typeof consumer === "object" && "delete" in consumer && typeof consumer.delete === "function") {
+      void Promise.resolve(consumer.delete()).catch(() => {
+        /* connection drained or consumer already gone */
+      });
+    }
   }
 
   private handleChannelEntry(e: KvEntry): void {

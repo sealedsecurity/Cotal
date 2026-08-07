@@ -564,6 +564,16 @@ function permissionsFor(
     // Presence: watch (read, public roster) + flow control + PUT OWN KEY ONLY.
     `$JS.API.CONSUMER.CREATE.${KV}.>`,
     `$JS.API.CONSUMER.INFO.${KV}.>`,
+    // Delete an ephemeral kv.watch ordered consumer on reconnect/stop (SEA-1821). `.>` is the minimal
+    // EXPRESSIBLE scope: NATS can't owner-scope a consumer name, so the grant nominally covers ANY
+    // consumer on this KV stream. Peer isolation instead rests on two things: the agent has NO
+    // CONSUMER.LIST/NAMES grant (it can't enumerate consumers) and watch-consumer names are
+    // unguessable library nuids — so it can only delete a name it created itself. It's symmetric with
+    // the CREATE.>/INFO.> grants just above (same shape, same stream). KV *records* stay protected
+    // separately by the own-key-only `$KV.<bucket>.<id>` grant below. Without this delete grant the
+    // leaked ordered consumers pile up unbounded in auth mode (the delete is server-refused) and peg
+    // the broker — fleet-fatal.
+    `$JS.API.CONSUMER.DELETE.${KV}.>`,
     "$JS.FC.>",
     `$KV.${presenceBucket(space)}.${id}`, // own presence key only — can't spoof peers
     // Channel registry: read-only (watch + direct kv.get for the join-time replay decision).
@@ -571,6 +581,10 @@ function permissionsFor(
     `$JS.API.STREAM.MSG.GET.${CHKV}`,
     `$JS.API.CONSUMER.CREATE.${CHKV}.>`,
     `$JS.API.CONSUMER.INFO.${CHKV}.>`,
+    // Delete an ephemeral kv.watch ordered consumer on reconnect/stop (SEA-1821) — same rationale as
+    // the presence-KV delete above: `.>` is the minimal expressible scope, peer isolation rests on
+    // no-LIST/NAMES + unguessable nuid names, and channel records stay privileged-write default-deny.
+    `$JS.API.CONSUMER.DELETE.${CHKV}.>`,
     // Delivery lease/readiness: READ-ONLY (kv.get) for the non-gating `cotal_channels` delivery-health
     // surface (Component 6). The lease key is daemon-availability info, like the world-readable roster;
     // NO write grant — only the `delivery` cred writes it.

@@ -105,6 +105,8 @@
     "smoke:delivery-boot-retry:auth": "tsx packages/core/smoke/delivery-boot-retry.smoke.ts",
     "smoke:delivery-old-manager": "tsx implementations/cli/smoke/delivery-old-manager-preflight.smoke.ts",
     "smoke:delivery-reconnect:auth": "tsx packages/core/smoke/delivery-reconnect.smoke.ts",
+    "smoke:reconnect-watch-leak": "tsx packages/core/smoke/reconnect-watch-leak.smoke.ts",
+    "smoke:reconnect-watch-leak:acl:auth": "tsx packages/core/smoke/reconnect-watch-leak-acl-auth.smoke.ts",
     "smoke:delivery-broker-coupling": "tsx implementations/delivery/smoke/delivery-broker-coupling.smoke.ts",
     "smoke:cli-kernel": "tsx implementations/cli/smoke/command-kernel.smoke.ts",
     "smoke:flag-inventory": "tsx bin/smoke/flag-inventory.smoke.ts",
