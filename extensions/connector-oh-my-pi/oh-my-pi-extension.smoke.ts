@@ -440,12 +440,26 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	assert(degradedOf(zodV4.z.string().max(3)) === undefined, "reporting: no false positive");
 	assert(degradedOf(zodV4.z.array(zodV4.z.string()).min(1)) === undefined, "reporting: no false positive on cardinality");
 
-	// A host whose every builder throws — the worst case a real facade can present.
-	const boom = new Proxy({}, { get: () => () => { throw new Error("host rejected the call"); } });
+	// A host where every builder EXCEPT `object`/`unknown` throws — the worst case a real
+	// facade can present. It must be a live Proxy, not a spread of one: `{...proxy}` copies
+	// only own enumerable keys, of which a Proxy over `{}` has none, so spreading yields an
+	// empty object and every builder reads `undefined` instead of throwing — a different
+	// failure, and one that would let this case pass while testing almost nothing.
+	const hostileZ = new Proxy(
+		{ object: zodV4.z.object, unknown: zodV4.z.unknown },
+		{
+			get: (target, prop) =>
+				prop in target
+					? target[prop as keyof typeof target]
+					: () => {
+							throw new Error(`host rejected .${String(prop)}()`);
+						},
+		},
+	);
 	const tools = new Map<string, RegisteredTool>();
 	const pi = {
-		// `object`/`unknown` must still work, or there is no tool to register at all.
-		zod: { z: { ...(boom as object), object: zodV4.z.object, unknown: zodV4.z.unknown, string: () => { throw new Error("host rejected the call"); } } },
+		// `object`/`unknown` must work, or there is no tool to register at all.
+		zod: { z: hostileZ },
 		logger: console,
 		registerTool: (t: RegisteredTool) => tools.set(t.name, t),
 		on: () => {},
