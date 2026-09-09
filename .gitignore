@@ -11,3 +11,6 @@ remotion/out/
 examples/02-self-improving-console/harness/.*.log
 examples/04-frontier-faces/assets/
 product
+
+# build-cache marker written by the local build helper
+.last-built-sha

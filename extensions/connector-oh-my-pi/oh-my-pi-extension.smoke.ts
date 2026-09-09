@@ -133,5 +133,55 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	console.log("4) session_start + hasUI gates mesh-join OK ✅");
 }
 
+// ---- 5. schema members are rebuilt with the HOST's zod -------------------------
+// Regression for the pi-coding-agent 18.x break: `pi.zod` there is a zod-shaped facade
+// over an IR schema engine, and its `z.object()` rejects members built by another zod
+// copy ("undefined is not an object (evaluating 'schema.ir.desc')"). Tests 1-4 inject
+// the SAME zod the specs use, so a foreign member never occurs and the bug is invisible
+// to them. This host records what it is handed and refuses anything it did not build —
+// the property the real 18.x host enforces.
+{
+	process.env.COTAL_NAME = "smoke-peer";
+	const BUILT = Symbol("host-built");
+	const built = <T extends object>(o: T): T => Object.assign(o, { [BUILT]: true });
+	const leaf = () => built({
+		max: () => leaf(),
+		optional: () => leaf(),
+		describe: () => leaf(),
+	});
+	// A host whose `object()` throws on any member it did not build itself.
+	const hostZ = {
+		string: () => leaf(),
+		boolean: () => leaf(),
+		enum: () => leaf(),
+		array: () => leaf(),
+		unknown: () => leaf(),
+		object: (shape: Record<string, unknown>) => {
+			for (const [key, member] of Object.entries(shape ?? {})) {
+				if ((member as Record<symbol, unknown>)?.[BUILT] !== true) {
+					throw new Error(`foreign schema member '${key}' — host did not build it`);
+				}
+			}
+			return built({ shape });
+		},
+	};
+	const tools = new Map<string, RegisteredTool>();
+	const pi = {
+		zod: { z: hostZ },
+		logger: console,
+		registerTool: (t: RegisteredTool) => tools.set(t.name, t),
+		on: () => {},
+		sendMessage: () => {},
+		registerCommand: () => {},
+		setLabel: () => {},
+	};
+	// Before the fix this threw while registering the first spec with params.
+	cotalMesh(pi as never);
+	assert(tools.size > 0, "IR-style host: specs still register");
+	assert(tools.has("cotal_send"), "IR-style host: a spec with params registered");
+	assert(tools.has("cotal_feedback"), "IR-style host: a spec with enum + max params registered");
+	console.log(`5) schema members rebuilt with host zod OK ✅ (${tools.size} tools)`);
+}
+
 console.log("\nCOTAL-MESH EXTENSION SMOKE OK ✅");
 process.exit(0);

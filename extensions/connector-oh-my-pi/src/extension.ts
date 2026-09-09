@@ -151,10 +151,18 @@ function registerSpec(
 		return;
 	}
 
-	// The shared spec carries a Zod raw shape from connector-core's own zod copy; rebuild it with the
-	// host's injected zod (pi.zod) so the schema type matches OMP's tool registry. The cast bridges the
-	// two structurally-identical zod copies at this single boundary (raw shapes are plain objects).
-	const parameters = z.object((spec.schema ?? {}) as Parameters<typeof z.object>[0]);
+	// The shared spec carries schema members built with connector-core's OWN zod. Under
+	// pi-coding-agent 18.x `pi.zod` is a zod-shaped facade over an IR schema engine, so its
+	// `z.object()` walks members expecting IR nodes and throws on a foreign ZodType
+	// ("undefined is not an object (evaluating 'schema.ir.desc')"). Rebuilding only the
+	// container is not enough — each MEMBER must be re-rendered with the host's `z`.
+	// `hostMember` reads the spec member's shape by introspection and rebuilds it, which is
+	// correct on both the zod-backed (17.x) and IR-backed (18.x) hosts.
+	const shape: Record<string, unknown> = {};
+	for (const [key, member] of Object.entries(spec.schema ?? {})) {
+		shape[key] = hostMember(z, member);
+	}
+	const parameters = z.object(shape as Parameters<typeof z.object>[0]);
 	pi.registerTool<ReturnType<typeof z.object>>({
 		name: spec.name,
 		label: spec.title,
@@ -164,4 +172,67 @@ function registerSpec(
 			return toResult(await spec.run(agent, config, params ?? {}));
 		},
 	});
+}
+
+/** Zod-v4 internals we introspect on a spec member. Only the subset the shared specs use:
+ *  `string` (with an optional `max_length` check), `boolean`, `enum`, `array`, each optionally
+ *  wrapped in `optional`. Reading `_zod.def` is the documented v4 introspection surface. */
+interface ZodDef {
+	type?: string;
+	innerType?: ZodInternals;
+	element?: ZodInternals;
+	entries?: Record<string, string>;
+	checks?: { _zod?: { def?: { check?: string; maximum?: number } } }[];
+}
+interface ZodInternals {
+	_zod?: { def?: ZodDef };
+	description?: string;
+}
+
+/** PURE: rebuild one spec schema member with the HOST's zod.
+ *
+ *  The spec's members come from connector-core's own zod copy. A 17.x host is zod-backed and
+ *  tolerates them; an 18.x host is IR-backed and throws. Rebuilding from the member's own
+ *  introspected shape is correct on both, because the result is always built by the host.
+ *
+ *  An unrecognized member degrades to `z.unknown()` rather than throwing: a tool with a loose
+ *  param still registers and works, where a throw would take the whole mesh connector down —
+ *  which is the exact failure this function exists to prevent. */
+function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
+	const node = member as ZodInternals;
+	const def = node?._zod?.def;
+	if (def === undefined) return z.unknown();
+
+	// `.describe()` after `.optional()` lands on the OUTER node; before it, on the inner one.
+	const inner = def.type === "optional" ? def.innerType : undefined;
+	const core = inner ?? node;
+	const coreDef = core._zod?.def;
+	const description = node.description ?? core.description;
+
+	let built: { describe(d: string): unknown; optional(): unknown };
+	switch (coreDef?.type) {
+		case "string": {
+			let s = z.string();
+			const max = coreDef.checks?.find((c) => c._zod?.def?.check === "max_length")?._zod?.def?.maximum;
+			if (max !== undefined) s = s.max(max);
+			built = s;
+			break;
+		}
+		case "boolean":
+			built = z.boolean();
+			break;
+		case "enum": {
+			const values = Object.values(coreDef.entries ?? {});
+			built = values.length > 0 ? z.enum(values as [string, ...string[]]) : z.string();
+			break;
+		}
+		case "array":
+			built = z.array(hostMember(z, coreDef.element) as Parameters<typeof z.array>[0]);
+			break;
+		default:
+			return z.unknown();
+	}
+
+	if (description !== undefined) built = built.describe(description) as typeof built;
+	return inner !== undefined ? built.optional() : built;
 }
