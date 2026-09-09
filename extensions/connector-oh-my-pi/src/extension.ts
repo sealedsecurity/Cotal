@@ -160,7 +160,16 @@ function registerSpec(
 	// correct on both the zod-backed (17.x) and IR-backed (18.x) hosts.
 	const shape: Record<string, unknown> = {};
 	for (const [key, member] of Object.entries(spec.schema ?? {})) {
+		// A degraded member is a silent contract change: this connector would serve a looser
+		// tool than every other one, with no signal. Name it in the log the connector
+		// already writes to, so a spec adding an unhandled kind is discoverable.
+		const kind = unwrapKind(member);
 		shape[key] = hostMember(z, member);
+		if (!TRANSLATED_KINDS.has(kind ?? "")) {
+			pi.logger.warn(
+				`[cotal-mesh] ${spec.name}.${key}: unhandled schema kind "${kind ?? "unreadable"}" — degraded to unknown`,
+			);
+		}
 	}
 	const parameters = z.object(shape as Parameters<typeof z.object>[0]);
 	pi.registerTool<ReturnType<typeof z.object>>({
@@ -175,18 +184,40 @@ function registerSpec(
 }
 
 /** Zod-v4 internals we introspect on a spec member. Only the subset the shared specs use:
- *  `string` (with an optional `max_length` check), `boolean`, `enum`, `array`, each optionally
- *  wrapped in `optional`. Reading `_zod.def` is the documented v4 introspection surface. */
+ *  `string` (with optional `min_length` / `max_length` / regex-format checks), `boolean`, `enum`,
+ *  `array`, each optionally wrapped in `optional`. `_zod.def` is the v4 introspection surface. */
+interface ZodCheckDef {
+	check?: string;
+	format?: string;
+	pattern?: RegExp;
+	maximum?: number;
+	minimum?: number;
+}
 interface ZodDef {
 	type?: string;
 	innerType?: ZodInternals;
 	element?: ZodInternals;
-	entries?: Record<string, string>;
-	checks?: { _zod?: { def?: { check?: string; maximum?: number } } }[];
+	// zod types `entries` as the enum's generic value type, NOT `string` — `z.enum({A:1})`
+	// really does yield numbers. Declaring `unknown` keeps the typechecker honest; the
+	// enum arm filters to strings rather than casting over the difference.
+	entries?: Record<string, unknown>;
+	checks?: { _zod?: { def?: ZodCheckDef } }[];
 }
 interface ZodInternals {
 	_zod?: { def?: ZodDef };
 	description?: string;
+}
+
+/** The member kinds `hostMember` reproduces faithfully. Anything else degrades to
+ *  `z.unknown()`, which is a contract change worth logging — see the caller. */
+const TRANSLATED_KINDS = new Set(["string", "boolean", "enum", "array"]);
+
+/** PURE: the kind of a member, looking through an `optional` wrapper. `undefined` when the
+ *  member carries no readable zod internals at all. */
+function unwrapKind(member: unknown): string | undefined {
+	const def = (member as ZodInternals)?._zod?.def;
+	if (def === undefined) return undefined;
+	return def.type === "optional" ? def.innerType?._zod?.def?.type : def.type;
 }
 
 /** PURE: rebuild one spec schema member with the HOST's zod.
@@ -198,7 +229,7 @@ interface ZodInternals {
  *  An unrecognized member degrades to `z.unknown()` rather than throwing: a tool with a loose
  *  param still registers and works, where a throw would take the whole mesh connector down —
  *  which is the exact failure this function exists to prevent. */
-function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
+export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
 	const node = member as ZodInternals;
 	const def = node?._zod?.def;
 	if (def === undefined) return z.unknown();
@@ -213,8 +244,17 @@ function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
 	switch (coreDef?.type) {
 		case "string": {
 			let s = z.string();
-			const max = coreDef.checks?.find((c) => c._zod?.def?.check === "max_length")?._zod?.def?.maximum;
-			if (max !== undefined) s = s.max(max);
+			// Carry every constraint the specs use. A dropped one silently loosens the tool
+			// contract the model is shown, which is worse than a load failure: it never surfaces.
+			for (const check of coreDef.checks ?? []) {
+				const c = check._zod?.def;
+				if (c === undefined) continue;
+				if (c.check === "max_length" && c.maximum !== undefined) s = s.max(c.maximum);
+				else if (c.check === "min_length" && c.minimum !== undefined) s = s.min(c.minimum);
+				else if (c.check === "string_format" && c.format === "regex" && c.pattern !== undefined) {
+					s = s.regex(c.pattern);
+				}
+			}
 			built = s;
 			break;
 		}
@@ -222,7 +262,12 @@ function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
 			built = z.boolean();
 			break;
 		case "enum": {
-			const values = Object.values(coreDef.entries ?? {});
+			// Keep only string members: a numeric enum fed to the host's `z.enum` yields a
+			// schema that matches NOTHING (rejects both 1 and "1"), which is an uncallable
+			// param. Widening to `z.string()` is the same loosening as the fallback below.
+			const values = Object.values(coreDef.entries ?? {}).filter(
+				(v): v is string => typeof v === "string",
+			);
 			built = values.length > 0 ? z.enum(values as [string, ...string[]]) : z.string();
 			break;
 		}
@@ -230,7 +275,12 @@ function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
 			built = z.array(hostMember(z, coreDef.element) as Parameters<typeof z.array>[0]);
 			break;
 		default:
-			return z.unknown();
+			// Fall THROUGH to the optional re-wrap below — never return early. A bare
+			// `z.unknown()` member is REQUIRED in zod, so returning here would flip an
+			// unhandled optional param to mandatory: a NARROWING, the opposite of the
+			// graceful loosening this fallback exists to provide.
+			built = z.unknown();
+			break;
 	}
 
 	if (description !== undefined) built = built.describe(description) as typeof built;

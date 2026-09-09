@@ -7,9 +7,9 @@
  * Asserts: inert without identity; with identity it registers the cotal_* tool surface, subscribes
  * to the lifecycle events, and cotal_inbox is read-only.
  */
-import cotalMesh from "./src/extension.ts";
+import cotalMesh, { hostMember } from "./src/extension.ts";
 import * as zodV4 from "zod/v4";
-import { MeshAgent } from "@cotal-ai/connector-core";
+import { MeshAgent, cotalToolSpecs, configFromEnv } from "@cotal-ai/connector-core";
 
 function assert(cond: unknown, msg: string): asserts cond {
 	if (!cond) {
@@ -181,6 +181,85 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	assert(tools.has("cotal_send"), "IR-style host: a spec with params registered");
 	assert(tools.has("cotal_feedback"), "IR-style host: a spec with enum + max params registered");
 	console.log(`5) schema members rebuilt with host zod OK ✅ (${tools.size} tools)`);
+}
+
+// ---- 6. translation preserves every constraint ---------------------------------
+// Case 5 only proves registration does not THROW. It cannot see a constraint that was
+// silently dropped, because its fake host returns chainable stubs — and a dropped
+// constraint is worse than a load failure: it loosens the tool contract the model is
+// shown and never surfaces. This drives the real zod as the "host" and compares the
+// JSON Schema of every spec member before and after translation.
+//
+// This case exists because `pattern` on cotal_persona.name WAS being dropped: the string
+// branch only carried `max_length`.
+{
+	process.env.COTAL_NAME = "smoke-peer";
+	// The manager-op tools (cotal_spawn / cotal_persona) only exist with the `spawn`
+	// capability, and cotal_persona.name is the member that carried the dropped regex —
+	// so a run without it checks 29 members and misses the exact one that broke.
+	const prevCaps = process.env.COTAL_CAPABILITIES;
+	process.env.COTAL_CAPABILITIES = "spawn";
+	const specs = cotalToolSpecs(configFromEnv(), "oh-my-pi");
+	if (prevCaps === undefined) delete process.env.COTAL_CAPABILITIES;
+	else process.env.COTAL_CAPABILITIES = prevCaps;
+	assert(
+		specs.some((s) => s.name === "cotal_persona"),
+		"constraint fidelity: capability-gated specs are in scope",
+	);
+	let checked = 0;
+	const lost: string[] = [];
+	for (const spec of specs) {
+		for (const [key, member] of Object.entries(spec.schema ?? {})) {
+			checked++;
+			// zodV4 IS the host here, so a faithful translation must round-trip identically.
+			const before = zodV4.z.toJSONSchema(zodV4.z.object({ [key]: member })) as {
+				properties: Record<string, Record<string, unknown>>;
+				required?: string[];
+			};
+			const after = zodV4.z.toJSONSchema(
+				zodV4.z.object({ [key]: hostMember(zodV4.z, member) as never }),
+			) as { properties: Record<string, Record<string, unknown>>; required?: string[] };
+			const a = before.properties[key] ?? {};
+			const b = after.properties[key] ?? {};
+			for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+				if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) {
+					lost.push(`${spec.name}.${key}: ${k} ${JSON.stringify(a[k])} -> ${JSON.stringify(b[k])}`);
+				}
+			}
+			if (JSON.stringify(before.required ?? []) !== JSON.stringify(after.required ?? [])) {
+				lost.push(`${spec.name}.${key}: optionality changed`);
+			}
+		}
+	}
+	assert(checked > 0, "constraint fidelity: found spec members to check");
+	assert(lost.length === 0, `constraint fidelity: translation lost ${lost.length} — ${lost.join("; ")}`);
+	console.log(`6) translation preserves every constraint OK ✅ (${checked} members)`);
+}
+
+// ---- 7. the unknown-kind fallback LOOSENS, never narrows -----------------------
+// Case 6 can only see kinds the specs use today, so it cannot defend the fallback: the
+// day a spec adds `z.number()` or `.nullable()`, case 6 still passes. The fallback's whole
+// purpose is to widen a member it cannot translate rather than kill the connector — but an
+// early return skips the `.optional()` re-wrap, and a BARE `z.unknown()` member is REQUIRED
+// in zod. That would flip a future optional param to mandatory: a narrowing, the exact
+// opposite of the intent, and visible only on the omp connector.
+{
+	const unhandledOptional = zodV4.z.number().optional().describe("a future optional param");
+	const rebuilt = hostMember(zodV4.z as never, unhandledOptional) as never;
+	const schema = zodV4.z.object({ limit: rebuilt });
+	assert(
+		schema.safeParse({}).success,
+		"fallback: an unhandled OPTIONAL member stays optional (bare z.unknown() would be required)",
+	);
+	assert(
+		schema.safeParse({ limit: 5 }).success,
+		"fallback: an unhandled member accepts its original value (widened, not narrowed)",
+	);
+	// A REQUIRED unhandled member must stay required — widening applies to the type, not arity.
+	const unhandledRequired = zodV4.z.number().describe("a future required param");
+	const req = zodV4.z.object({ n: hostMember(zodV4.z as never, unhandledRequired) as never });
+	assert(!req.safeParse({}).success, "fallback: an unhandled REQUIRED member stays required");
+	console.log("7) unknown-kind fallback loosens without narrowing OK ✅");
 }
 
 console.log("\nCOTAL-MESH EXTENSION SMOKE OK ✅");
