@@ -165,10 +165,23 @@ function registerSpec(
 		// tool than every other one, with no signal. `hostMember` reports the degradation
 		// itself rather than the caller re-deriving which kinds it handles — one source of
 		// truth, so the switch and the warning cannot drift apart.
-		const { schema, degraded } = hostMember(z, member);
-		shape[key] = schema;
-		if (degraded !== undefined) {
-			log(`${spec.name}.${key}: ${degraded}`, "warn");
+		//
+		// The catch makes the never-throw contract real rather than merely documented. It
+		// cannot be enforced by types: `z` is typed as zod, but an 18.x host is a different
+		// object that only resembles it, so a missing or stricter builder method surfaces at
+		// RUNTIME. Unguarded, one throw here escapes the extension factory and removes EVERY
+		// cotal_* tool — the silent total outage this whole function exists to prevent, and
+		// the process still exits 0. One loose param plus a warning is the better trade.
+		let result: HostMemberResult;
+		try {
+			result = hostMember(z, member);
+		} catch (e) {
+			const reason = e instanceof Error ? e.message : String(e);
+			result = { schema: z.unknown(), degraded: `translation threw (${reason}) — widened to unknown` };
+		}
+		shape[key] = result.schema;
+		if (result.degraded !== undefined) {
+			log(`${spec.name}.${key}: ${result.degraded}`, "warn");
 		}
 	}
 	const parameters = z.object(shape as Parameters<typeof z.object>[0]);
@@ -188,6 +201,7 @@ function registerSpec(
  *  `array`, each optionally wrapped in `optional`. `_zod.def` is the v4 introspection surface. */
 interface ZodCheckDef {
 	check?: string;
+	length?: number;
 	/** Present on a `string_format` check; dispatch is on `pattern`, since zod precomputes
 	 *  one for every format it can express as a regex. */
 	pattern?: RegExp;
@@ -208,8 +222,12 @@ interface ZodDef {
 	entries?: Record<string, unknown>;
 	checks?: { _zod?: { def?: ZodCheckDef } }[];
 }
-/** The builder surface `hostMember` chains on. Self-referential so `.optional()` keeps its
- *  type instead of erasing to `unknown` and forcing a cast straight back. */
+/** The two calls `hostMember` makes AFTER the switch, once an arm has built its schema.
+ *  Self-referential so `.optional()` keeps its type instead of erasing to `unknown` and
+ *  forcing a cast straight back. The arm-local builders (`.regex`/`.min`/`.max`) are typed
+ *  by the host `z` parameter, NOT by this interface — and on an 18.x IR host that type is
+ *  structurally a lie, so those calls are unchecked at compile time. Hence the caller
+ *  treats a translation throw as a degradation. */
 interface Chainable {
 	describe(d: string): Chainable;
 	optional(): Chainable;
@@ -261,12 +279,18 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 	switch (coreDef?.type) {
 		case "string": {
 			let s = z.string();
+			// Patterns are collected and applied LAST, after every length bound. An 18.x host
+			// implements `.min()`/`.max()` by wrapping the node in an IR `morph`, and it then
+			// REFUSES `.regex()` on a morph — so interleaving them in zod's authoring order
+			// (regex → max → regex) throws on the real host. Applying all lengths, then all
+			// patterns, is order-independent for the resulting schema and never hits that.
+			const patterns: RegExp[] = [];
 			// A format built by `z.email()` / `z.url()` / `z.uuid()` is NOT in `checks` — it
 			// is a top-level `format` on the def, with a precomputed `pattern` for most.
 			// Carry the pattern where there is one, and report the rest: without this the
 			// constraint disappears with the loop never seeing it.
 			if (coreDef.format !== undefined) {
-				if (coreDef.pattern !== undefined) s = s.regex(coreDef.pattern);
+				if (coreDef.pattern !== undefined) patterns.push(coreDef.pattern);
 				else losses.push(`string format "${coreDef.format}" has no pattern — constraint dropped`);
 			}
 			// Carry every constraint the specs use. A dropped one silently loosens the tool
@@ -278,15 +302,20 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 				if (c === undefined) continue;
 				if (c.check === "max_length" && c.maximum !== undefined) s = s.max(c.maximum);
 				else if (c.check === "min_length" && c.minimum !== undefined) s = s.min(c.minimum);
-				else if (c.check === "string_format" && c.pattern !== undefined) {
-					// zod precomputes a pattern for the formats it can express as one
+				else if (c.check === "length_equals" && c.length !== undefined) {
+					// `.length(n)` is a single check, not a min/max pair, but it is exactly
+					// reproducible as both bounds with builders already in use.
+					s = s.min(c.length).max(c.length);
+				} else if (c.pattern !== undefined) {
+					// zod precomputes a pattern for every format it can express as one
 					// (regex, starts_with, ends_with, includes), so one branch carries all.
-					s = s.regex(c.pattern);
+					patterns.push(c.pattern);
 				} else if (c.check !== undefined && c.check !== "overwrite") {
 					// `overwrite` (.trim()/.toLowerCase()) has no schema representation at all.
 					losses.push(`string check "${c.check}" not reproducible — constraint dropped`);
 				}
 			}
+			for (const pattern of patterns) s = s.regex(pattern);
 			built = s;
 			break;
 		}
@@ -297,16 +326,34 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 			// Keep only string members: a numeric enum fed to the host's `z.enum` yields a
 			// schema that matches NOTHING (rejects both 1 and "1"), which is an uncallable
 			// param. Widening to `z.string()` is the same loosening as the fallback below.
-			const values = Object.values(coreDef.entries ?? {}).filter(
-				(v): v is string => typeof v === "string",
-			);
-			built = values.length > 0 ? z.enum(values as [string, ...string[]]) : z.string();
+			const all = Object.values(coreDef.entries ?? {});
+			const values = all.filter((v): v is string => typeof v === "string");
+			if (values.length === 0) {
+				// A host rejects an empty enum outright, so this guard is load-bearing.
+				// Report the cause: an all-numeric enum and a genuinely empty one both
+				// land here, and only the first is surprising.
+				losses.push(
+					all.length > 0
+						? `enum has no string members (${all.length} numeric) — widened to string`
+						: "enum has no members — widened to string",
+				);
+				built = z.string();
+			} else {
+				if (values.length !== all.length) {
+					losses.push(
+						`enum dropped ${all.length - values.length} non-string member(s) — narrowed to its string values`,
+					);
+				}
+				built = z.enum(values as [string, ...string[]]);
+			}
 			break;
 		}
 		case "array": {
 			const element = hostMember(z, coreDef.element);
 			// An untranslatable element degrades the array too — report the inner kind.
-			if (element.degraded !== undefined) losses.push(element.degraded);
+			// Prefix so the phrase says WHERE the loss was: the array itself is faithful,
+			// only its items widened. Composes on recursion, keeping the depth legible.
+			if (element.degraded !== undefined) losses.push(`array element: ${element.degraded}`);
 			let a = z.array(element.schema as Parameters<typeof z.array>[0]);
 			// Cardinality lives in the array's own checks, same shape as a string's length.
 			for (const check of coreDef.checks ?? []) {
@@ -314,7 +361,9 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 				if (c === undefined) continue;
 				if (c.check === "max_length" && c.maximum !== undefined) a = a.max(c.maximum);
 				else if (c.check === "min_length" && c.minimum !== undefined) a = a.min(c.minimum);
-				else if (c.check !== undefined) {
+				else if (c.check === "length_equals" && c.length !== undefined) {
+					a = a.min(c.length).max(c.length);
+				} else if (c.check !== undefined && c.check !== "overwrite") {
 					losses.push(`array check "${c.check}" not reproducible — constraint dropped`);
 				}
 			}

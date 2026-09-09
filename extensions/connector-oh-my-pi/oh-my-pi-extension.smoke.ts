@@ -50,6 +50,11 @@ function fakePi() {
 delete process.env.COTAL_NAME;
 delete process.env.COTAL_LINK;
 delete process.env.COTAL_AGENT_FILE;
+// COTAL_CREDS is a PATH to configFromEnv, so an inherited value either crashes the suite
+// outright (ENOENT, at case 2, before any per-case save/restore runs) or silently changes
+// the capability surface and thus which tools exist. Pin it once here so every case runs
+// against a known surface wherever the suite is invoked — including on a live agent.
+delete process.env.COTAL_CREDS;
 {
 	const { pi, tools, events } = fakePi();
 	cotalMesh(pi as never);
@@ -167,7 +172,15 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		string: () => leaf(),
 		boolean: () => leaf(),
 		enum: () => leaf(),
-		array: () => leaf(),
+		// Check what we are HANDED, not just that we were called: an unrecursed element is
+		// exactly the foreign member this case exists to catch, and the real 18.x host does
+		// reject it (`undefined is not an object (evaluating 'ir.k')` — this PR's bug).
+		array: (el: unknown) => {
+			if ((el as Record<symbol, unknown>)?.[BUILT] !== true) {
+				throw new Error("foreign array element — host did not build it");
+			}
+			return leaf();
+		},
 		unknown: () => leaf(),
 		object: (shape: Record<string, unknown>) => {
 			for (const [key, member] of Object.entries(shape ?? {})) {
@@ -226,9 +239,30 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		specs.some((s) => s.name === "cotal_persona"),
 		"constraint fidelity: capability-gated specs are in scope",
 	);
+	// The 38 real members only cover the kinds the CURRENT specs happen to use: no array
+	// cardinality, no string .min(), no top-level format, no non-string enum. So the
+	// branches handling those are unobservable here — each could be deleted outright with
+	// this sweep still green. These synthetic members make them observable, and every one
+	// is a shape ordinary spec authoring would produce.
+	const synthetic: Record<string, unknown> = {
+		arrayMinMax: zodV4.z.array(zodV4.z.string()).min(1).max(5),
+		arrayNested: zodV4.z.array(zodV4.z.string().max(3)).min(1),
+		arrayLength: zodV4.z.array(zodV4.z.string()).length(2),
+		stringMinMax: zodV4.z.string().min(2).max(9),
+		stringLength: zodV4.z.string().length(8),
+		// The interleaving that throws on a real 18.x host if patterns are not deferred.
+		stringRegexLen: zodV4.z.string().regex(/^a/).max(10).regex(/b$/),
+		email: zodV4.z.email(),
+		uuid: zodV4.z.uuid(),
+		optionalDescribed: zodV4.z.string().max(4).optional().describe("D"),
+	};
+	const allSpecs: { name: string; schema: Record<string, unknown> }[] = [
+		...specs.map((sp) => ({ name: sp.name, schema: (sp.schema ?? {}) as Record<string, unknown> })),
+		{ name: "__synthetic__", schema: synthetic },
+	];
 	let checked = 0;
 	const lost: string[] = [];
-	for (const spec of specs) {
+	for (const spec of allSpecs) {
 		for (const [key, member] of Object.entries(spec.schema ?? {})) {
 			checked++;
 			// zodV4 IS the host here, so a faithful translation must round-trip identically.
@@ -242,6 +276,11 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			const a = before.properties[key] ?? {};
 			const b = after.properties[key] ?? {};
 			for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+				// `format` is carried AS its precomputed `pattern` (z.email() etc. keep the
+				// regex, lose the cosmetic keyword). Where the pattern matches, the
+				// constraint survived, so demanding the keyword too would fail a faithful
+				// translation — and a red gate gets the CODE "fixed", not the test.
+				if (k === "format" && JSON.stringify(a.pattern) === JSON.stringify(b.pattern)) continue;
 				if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) {
 					lost.push(`${spec.name}.${key}: ${k} ${JSON.stringify(a[k])} -> ${JSON.stringify(b[k])}`);
 				}
@@ -255,8 +294,8 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	// SHRINKING (it was 29 before the capability gate was pinned, hiding the broken member).
 	// A floor stays green when specs gain params and goes red when coverage narrows.
 	assert(
-		checked >= 38,
-		`constraint fidelity: swept ${checked} members, expected >= 38 — did the spec list shrink?`,
+		checked >= 47,
+		`constraint fidelity: swept ${checked} members, expected >= 47 — did the spec list shrink?`,
 	);
 	assert(lost.length === 0, `constraint fidelity: translation lost ${lost.length} — ${lost.join("; ")}`);
 	console.log(`6) translation preserves every constraint OK ✅ (${checked} members)`);
@@ -374,6 +413,51 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		"IR host: a required member keeps its description",
 	);
 	console.log("8) description survives .optional() on an IR-style host OK ✅");
+}
+
+
+// ---- 9. degradations are reported, and a throwing host cannot take the mesh down --
+// Two properties the JSON-Schema sweep cannot see. (a) A member that is narrowed or
+// widened must SAY so: every other arm reports, and a silent enum narrowing makes a
+// param uncallable on this connector only. (b) The never-throw contract must be real,
+// not documented — `z` is typed as zod, but an 18.x host is a different object that
+// merely resembles it, so a missing or stricter builder surfaces at RUNTIME. Unguarded,
+// one throw removes EVERY cotal_* tool while the process still exits 0.
+{
+	const degradedOf = (m: unknown) => hostMember(zodV4.z as never, m as never).degraded;
+	assert(
+		degradedOf(zodV4.z.enum({ A: 1, B: 2 } as never))?.includes("widened to string") === true,
+		"reporting: an all-numeric enum reports the widening",
+	);
+	assert(
+		degradedOf(zodV4.z.enum({ A: "a", B: 1 } as never))?.includes("narrowed") === true,
+		"reporting: a mixed enum reports the dropped members",
+	);
+	assert(
+		degradedOf(zodV4.z.array(zodV4.z.date()))?.startsWith("array element:") === true,
+		"reporting: an element loss says it was the element, not the array",
+	);
+	assert(degradedOf(zodV4.z.string().max(3)) === undefined, "reporting: no false positive");
+	assert(degradedOf(zodV4.z.array(zodV4.z.string()).min(1)) === undefined, "reporting: no false positive on cardinality");
+
+	// A host whose every builder throws — the worst case a real facade can present.
+	const boom = new Proxy({}, { get: () => () => { throw new Error("host rejected the call"); } });
+	const tools = new Map<string, RegisteredTool>();
+	const pi = {
+		// `object`/`unknown` must still work, or there is no tool to register at all.
+		zod: { z: { ...(boom as object), object: zodV4.z.object, unknown: zodV4.z.unknown, string: () => { throw new Error("host rejected the call"); } } },
+		logger: console,
+		registerTool: (t: RegisteredTool) => tools.set(t.name, t),
+		on: () => {},
+		sendMessage: () => {},
+		registerCommand: () => {},
+		setLabel: () => {},
+	};
+	process.env.COTAL_NAME = "smoke-peer";
+	cotalMesh(pi as never);
+	assert(tools.size > 0, "never-throw: a hostile host still registers tools, it does not kill the extension");
+	assert(tools.has("cotal_send"), "never-throw: a spec whose every member throws still registers");
+	console.log(`9) degradations reported; a throwing host degrades, not crashes OK ✅ (${tools.size} tools)`);
 }
 
 console.log("\nCOTAL-MESH EXTENSION SMOKE OK ✅");
