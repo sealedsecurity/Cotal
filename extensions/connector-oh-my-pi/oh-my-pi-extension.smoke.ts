@@ -286,7 +286,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	// The degradation must be REPORTED, not just survivable: silently serving a looser tool
 	// than every other connector is the failure this reporting exists to prevent.
 	assert(
-		hostMember(zodV4.z as never, unhandledOptional).degradedFrom === "number",
+		hostMember(zodV4.z as never, unhandledOptional).degraded?.includes('"number"') === true,
 		"fallback: reports the kind it could not translate",
 	);
 	// A kind the switch can NEVER learn, so this cannot decay: `number` is the likeliest
@@ -298,7 +298,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	};
 	const syn = hostMember(zodV4.z as never, synthetic);
 	assert(
-		syn.degradedFrom === "__never-handled__",
+		syn.degraded?.includes("__never-handled__") === true,
 		"fallback: names an arbitrary unhandled kind",
 	);
 	assert(
@@ -307,7 +307,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	);
 	// A handled kind must NOT report — a spurious warning trains readers to ignore the real one.
 	assert(
-		hostMember(zodV4.z as never, zodV4.z.string().optional()).degradedFrom === undefined,
+		hostMember(zodV4.z as never, zodV4.z.string().optional()).degraded === undefined,
 		"fallback: a translated kind reports no degradation",
 	);
 	console.log("7) unknown-kind fallback loosens without narrowing OK ✅");

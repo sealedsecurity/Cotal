@@ -165,13 +165,10 @@ function registerSpec(
 		// tool than every other one, with no signal. `hostMember` reports the degradation
 		// itself rather than the caller re-deriving which kinds it handles — one source of
 		// truth, so the switch and the warning cannot drift apart.
-		const { schema, degradedFrom } = hostMember(z, member);
+		const { schema, degraded } = hostMember(z, member);
 		shape[key] = schema;
-		if (degradedFrom !== undefined) {
-			log(
-				`${spec.name}.${key}: unhandled schema kind "${degradedFrom}" — degraded to unknown`,
-				"warn",
-			);
+		if (degraded !== undefined) {
+			log(`${spec.name}.${key}: ${degraded}`, "warn");
 		}
 	}
 	const parameters = z.object(shape as Parameters<typeof z.object>[0]);
@@ -198,6 +195,10 @@ interface ZodCheckDef {
 }
 interface ZodDef {
 	type?: string;
+	/** Set by `z.email()` / `z.url()` / `z.uuid()` etc, which carry the format on the def
+	 *  itself rather than in `checks` — most also precompute an equivalent `pattern`. */
+	format?: string;
+	pattern?: RegExp;
 	innerType?: ZodInternals;
 	element?: ZodInternals;
 	// zod types `entries` as the enum's generic value type, NOT `string` — `z.enum({A:1})`
@@ -216,7 +217,10 @@ interface ZodInternals {
  *  letting the caller re-derive it keeps one source of truth for which kinds are handled. */
 interface HostMemberResult {
 	schema: unknown;
-	degradedFrom?: string;
+	/** A ready-to-log phrase naming what could not be reproduced, when anything was lost.
+	 *  The message is built here because only this function knows WHAT it dropped — a whole
+	 *  kind (widened to `unknown`) or a single check on an otherwise-faithful member. */
+	degraded?: string;
 }
 
 /** PURE: rebuild one spec schema member with the HOST's zod.
@@ -230,12 +234,13 @@ interface HostMemberResult {
  *  which is the exact failure this function exists to prevent. An `optional`-wrapped member
  *  stays optional, so that degradation loosens rather than narrows. Other wrappers
  *  (`default`, `nullable`) are NOT preserved — they degrade to a required `unknown`, which
- *  narrows; they are reported via `degradedFrom` rather than silently accepted, and no
+ *  narrows; they are reported via `degraded` rather than silently accepted, and no
  *  current spec uses them. */
 export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMemberResult {
 	const node = member as ZodInternals;
 	const def = node?._zod?.def;
-	if (def === undefined) return { schema: z.unknown(), degradedFrom: "unreadable" };
+	if (def === undefined)
+		return { schema: z.unknown(), degraded: "unreadable member — widened to unknown" };
 
 	// `.describe()` after `.optional()` lands on the OUTER node; before it, on the inner one.
 	const inner = def.type === "optional" ? def.innerType : undefined;
@@ -243,14 +248,22 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 	const coreDef = core._zod?.def;
 	const description = node.description ?? core.description;
 
-	let degradedFrom: string | undefined;
+	let degraded: string | undefined;
 	let built: { describe(d: string): unknown; optional(): unknown };
 	switch (coreDef?.type) {
 		case "string": {
 			let s = z.string();
+			// A format built by `z.email()` / `z.url()` / `z.uuid()` is NOT in `checks` — it
+			// is a top-level `format` on the def, with a precomputed `pattern` for most.
+			// Carry the pattern where there is one, and report the rest: without this the
+			// constraint disappears with the loop never seeing it.
+			if (coreDef.format !== undefined) {
+				if (coreDef.pattern !== undefined) s = s.regex(coreDef.pattern);
+				else degraded = `string format "${coreDef.format}" has no pattern — constraint dropped`;
+			}
 			// Carry every constraint the specs use. A dropped one silently loosens the tool
 			// contract the model is shown, which is worse than a load failure: it never
-			// surfaces. Anything we cannot carry is named in `degradedFrom` rather than
+			// surfaces. Anything we cannot carry is named in `degraded` rather than
 			// vanishing — the kind still translates, so only the check is lost.
 			for (const check of coreDef.checks ?? []) {
 				const c = check._zod?.def;
@@ -258,13 +271,12 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 				if (c.check === "max_length" && c.maximum !== undefined) s = s.max(c.maximum);
 				else if (c.check === "min_length" && c.minimum !== undefined) s = s.min(c.minimum);
 				else if (c.check === "string_format" && c.pattern !== undefined) {
-					// zod precomputes a pattern for every string format it can express as one
-					// (regex, starts_with, ends_with, includes, email, …), so this single
-					// branch carries all of them rather than just `.regex()`.
+					// zod precomputes a pattern for the formats it can express as one
+					// (regex, starts_with, ends_with, includes), so one branch carries all.
 					s = s.regex(c.pattern);
 				} else if (c.check !== undefined && c.check !== "overwrite") {
 					// `overwrite` (.trim()/.toLowerCase()) has no schema representation at all.
-					degradedFrom = `string check "${c.check}"`;
+					degraded = `string check "${c.check}" not reproducible — constraint dropped`;
 				}
 			}
 			built = s;
@@ -286,7 +298,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 		case "array": {
 			const element = hostMember(z, coreDef.element);
 			// An untranslatable element degrades the array too — report the inner kind.
-			degradedFrom = element.degradedFrom;
+			degraded = element.degraded;
 			built = z.array(element.schema as Parameters<typeof z.array>[0]);
 			break;
 		}
@@ -296,7 +308,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 			// flip an unhandled optional param to mandatory — a NARROWING, the opposite of
 			// the graceful loosening this fallback exists to provide.
 			built = z.unknown();
-			degradedFrom = coreDef?.type ?? "unreadable";
+			degraded = `unhandled schema kind "${coreDef?.type ?? "unreadable"}" — widened to unknown`;
 			break;
 	}
 
@@ -306,7 +318,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 	// `.optional()` first and describing last matches how the specs are authored and keeps
 	// the description on both hosts (on zod the two orders are identical).
 	const wrapped = inner !== undefined ? built.optional() : built;
-	if (description === undefined) return { schema: wrapped, degradedFrom };
+	if (description === undefined) return { schema: wrapped, degraded };
 	const describable = wrapped as { describe(d: string): unknown };
-	return { schema: describable.describe(description), degradedFrom };
+	return { schema: describable.describe(description), degraded };
 }
