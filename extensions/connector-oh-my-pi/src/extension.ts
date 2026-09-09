@@ -129,7 +129,16 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 			registerSpec(pi, agent, config, spec, z, log);
 			registered++;
 		} catch (e) {
-			const reason = e instanceof Error ? e.message : String(e);
+			// `String(e)` calls the thrown value's own `toString`, which can itself throw.
+			// This is the outermost handler, so nothing above would contain that — it would
+			// escape the factory and cost every tool, which is the failure this guard exists
+			// to prevent, arriving through the guard's own error reporting.
+			let reason = "unknown";
+			try {
+				reason = e instanceof Error ? e.message : String(e);
+			} catch {
+				reason = "the thrown value's toString() also threw";
+			}
 			log(`${spec.name}: registration failed (${reason}) — tool not registered`, "warn");
 		}
 	}

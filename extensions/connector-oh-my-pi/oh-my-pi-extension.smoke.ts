@@ -292,7 +292,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			// This one member is EXPECTED to lose its format: zod precomputes no pattern for
 			// `url`, so there is nothing to carry. hostMember reports it (asserted in case 9);
 			// here we only require that the sweep SEES it rather than skipping it.
-			const expectedLoss = key === "urlNoPattern";
+			const expectedMember = key === "urlNoPattern";
 			for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
 				// `format` is carried AS its precomputed `pattern` (z.email() etc. keep the
 				// regex, lose the cosmetic keyword). Where the pattern matches, the
@@ -307,6 +307,9 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 					JSON.stringify(a.pattern) === JSON.stringify(b.pattern)
 				)
 					continue;
+				// Scope the excuse to the one KEY that is expected to change. Excusing the whole
+				// member would absorb a fabricated constraint on it as well.
+				const expectedLoss = expectedMember && k === "format";
 				if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) {
 					(expectedLoss ? expected : lost).push(
 						`${spec.name}.${key}: ${k} ${JSON.stringify(a[k])} -> ${JSON.stringify(b[k])}`,
@@ -512,6 +515,11 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		`reporting: an all-numeric enum is widened BEFORE the host sees it (got ${JSON.stringify(numericEnum.degraded)})`,
 	);
 
+	assert(
+		degradedOf(zodV4.z.enum({} as never))?.includes("enum has no members") === true,
+		"reporting: a genuinely-empty enum reports the widening",
+	);
+
 	// Hosts whose `.optional()` / `.describe()` throw. These are the two tail guards, and
 	// the hostile-Proxy host below cannot reach them: its failures happen inside the switch,
 	// so the tail operates on a real zod `unknown` whose wrappers never throw.
@@ -609,12 +617,15 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		// Observe the guard, do not merely survive it: a catch that swallows its own reason
 		// leaves a 0-of-17 boot with no line saying so, and "it did not throw" cannot tell
 		// that apart from a healthy load.
+		// Keep the levels APART. Collapsing them into one array makes every assertion here
+		// level-blind, and the escalation below is precisely a claim about level.
 		const warns2: string[] = [];
+		const errors2: string[] = [];
 		const pi2 = {
 			...pi,
 			zod: { z: z2 },
 			registerTool: () => {},
-			logger: { info: () => {}, warn: (m: string) => warns2.push(m), error: (m: string) => warns2.push(m) },
+			logger: { info: () => {}, warn: (m: string) => warns2.push(m), error: (m: string) => errors2.push(m) },
 		};
 		cotalMesh(pi2 as never);
 		assert(
@@ -622,20 +633,87 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			`never-throw: a host rejecting .${broken}() REPORTS the failed specs`,
 		);
 		if (broken === "object") {
-			// Nothing can register at all — the mesh-deaf boot. It must be legible as such.
+			// Nothing registered at all — a mesh-deaf boot. It must be legible AS SUCH, at
+			// error level: buried among N warns it reads like partial degradation.
 			assert(
-				warns2.some((w) => w.includes("registered 0 of")),
-				"never-throw: registering zero tools is summarised, not left to N separate warnings",
+				errors2.some((w) => w.includes("registered 0 of")),
+				`never-throw: a zero-tool boot is summarised at ERROR level (errors=${JSON.stringify(errors2)})`,
+			);
+			assert(
+				!warns2.some((w) => w.includes("registered 0 of")),
+				"never-throw: the zero-tool summary is not merely a warning",
 			);
 		}
+	}
+
+	// A PARTIAL failure takes the other arm of the escalation, which no host above reaches.
+	{
+		const warns3: string[] = [];
+		const errors3: string[] = [];
+		const wide = new Proxy(zodV4.z, {
+			get: (t, p) =>
+				p === "object"
+					? (shape: Record<string, unknown>) => {
+							if (Object.keys(shape).length >= 3) throw new Error("host rejected a wide object");
+							return t.object(shape as never);
+						}
+					: t[p as keyof typeof t],
+		});
+		const pi4 = {
+			...pi,
+			zod: { z: wide },
+			registerTool: () => {},
+			logger: { info: () => {}, warn: (m: string) => warns3.push(m), error: (m: string) => errors3.push(m) },
+		};
+		cotalMesh(pi4 as never);
+		assert(
+			warns3.some((w) => /registered \d+ of \d+ tools/.test(w)),
+			"never-throw: a PARTIAL failure is summarised at warn level",
+		);
+		assert(errors3.length === 0, "never-throw: a partial failure is not escalated to error");
+	}
+
+	// A host that throws a NON-Error whose own `toString` throws. This is the outermost
+	// handler, so nothing above contains it: reading the reason unguarded escapes the
+	// factory and costs every tool — the failure the guard exists to prevent, arriving
+	// through the guard's own error reporting.
+	{
+		const tools5 = new Map<string, RegisteredTool>();
+		const nasty = new Proxy(zodV4.z, {
+			get: (t, p) =>
+				p === "object"
+					? () => {
+							throw {
+								toString() {
+									throw new Error("toString blew up");
+								},
+							};
+						}
+					: t[p as keyof typeof t],
+		});
+		const pi5 = { ...pi, zod: { z: nasty }, registerTool: (t: RegisteredTool) => tools5.set(t.name, t) };
+		let escaped = "";
+		try {
+			cotalMesh(pi5 as never);
+		} catch (e) {
+			escaped = e instanceof Error ? e.message : "non-Error";
+		}
+		assert(escaped === "", `never-throw: a throw whose toString() throws is contained (escaped: ${escaped})`);
 	}
 
 	// A logger that throws must not cost a tool. The guards REPORT through `log`, so an
 	// unguarded logger turns a contained degradation into an escaped factory throw — losing
 	// everything, at rc=0, precisely when something already went wrong.
+	// Every level, not just `warn`: `info` fires on the ordinary "loaded" line of a HEALTHY
+	// boot, so leaving it unguarded is worse than the defect this replaces — that one only
+	// fired while already degrading.
 	for (const badLogger of [
 		{ info: () => {}, warn: () => { throw new Error("log write failed"); }, error: () => {} },
 		{ info: () => {}, error: () => {} },
+		{ info: () => { throw new Error("log write failed"); }, warn: () => {}, error: () => {} },
+		{ warn: () => {}, error: () => {} },
+		{ info: () => { throw new Error("x"); }, warn: () => { throw new Error("x"); }, error: () => { throw new Error("x"); } },
+		{},
 	]) {
 		const tools3 = new Map<string, RegisteredTool>();
 		const pi3 = {
