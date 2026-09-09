@@ -41,11 +41,19 @@ import { runPeerLoop } from "./interactive-loop.js";
 export default function cotalMesh(pi: ExtensionAPI): void {
 	// Route every connector diagnostic through OMP's FILE logger, never the shared terminal:
 	// a raw stderr write corrupts the live TUI, and mesh reconnect churn would otherwise flood it.
+	// Total by construction: the degradation guards below REPORT through this, so a logger
+	// that throws or lacks a level would convert a contained per-member or per-spec
+	// degradation into an escaped factory throw — losing every tool, at rc=0, exactly when
+	// something already went wrong. Diagnostics are best-effort; they never cost a tool.
 	const log: MeshLogger = (msg, level = "info") => {
 		const line = `[cotal-mesh] ${msg}`;
-		if (level === "error") pi.logger.error(line);
-		else if (level === "warn") pi.logger.warn(line);
-		else pi.logger.info(line);
+		try {
+			if (level === "error") pi.logger.error(line);
+			else if (level === "warn") pi.logger.warn(line);
+			else pi.logger.info(line);
+		} catch {
+			// Nowhere left to report a reporting failure.
+		}
 	};
 
 	// No identity → a plain `omp`, not a launcher-joined session. Stay off the mesh.
@@ -108,7 +116,10 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 
 	// ---- cotal_* tools, rendered from the shared specs ----------------------
 	const { z } = pi.zod;
+	let registered = 0;
+	let attempted = 0;
 	for (const spec of cotalToolSpecs(config, "oh-my-pi")) {
+		attempted++;
 		// One bad spec costs one tool, not all of them. `hostMember` guards the members, but
 		// the host's `object()` and `registerTool()` can reject a whole spec — the real 18.x
 		// `object()` throws on a member it dislikes, which is this connector's original bug.
@@ -116,10 +127,21 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 		// agent boots mesh-deaf and looks healthy.
 		try {
 			registerSpec(pi, agent, config, spec, z, log);
+			registered++;
 		} catch (e) {
 			const reason = e instanceof Error ? e.message : String(e);
 			log(`${spec.name}: registration failed (${reason}) — tool not registered`, "warn");
 		}
+	}
+
+	// Registering nothing is a mesh-deaf boot, not a warning. Per-spec lines carry the
+	// reasons, but the summary is what makes it legible: without this the operator sees N
+	// warns followed by a cheerful "loaded" and no indication the connector is inert.
+	if (registered < attempted) {
+		log(
+			`registered ${registered} of ${attempted} tools — ${attempted - registered} failed`,
+			registered === 0 ? "error" : "warn",
+		);
 	}
 
 	log(

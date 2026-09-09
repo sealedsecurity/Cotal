@@ -262,6 +262,10 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		// The interleaving that throws on a real 18.x host if patterns are not deferred.
 		stringRegexLen: zodV4.z.string().regex(/^a/).max(10).regex(/b$/),
 		email: zodV4.z.email(),
+		// A format with NO precomputed pattern: the constraint is genuinely lost, so it is
+		// swept to prove the `format` skip does not excuse it (see the skip's pattern
+		// condition). Its loss is expected and named, not silently tolerated.
+		urlNoPattern: zodV4.z.url(),
 		uuid: zodV4.z.uuid(),
 		optionalDescribed: zodV4.z.string().max(4).optional().describe("D"),
 	};
@@ -271,6 +275,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	];
 	let checked = 0;
 	const lost: string[] = [];
+	const expected: string[] = [];
 	for (const spec of allSpecs) {
 		for (const [key, member] of Object.entries(spec.schema ?? {})) {
 			checked++;
@@ -284,6 +289,10 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			) as { properties: Record<string, Record<string, unknown>>; required?: string[] };
 			const a = before.properties[key] ?? {};
 			const b = after.properties[key] ?? {};
+			// This one member is EXPECTED to lose its format: zod precomputes no pattern for
+			// `url`, so there is nothing to carry. hostMember reports it (asserted in case 9);
+			// here we only require that the sweep SEES it rather than skipping it.
+			const expectedLoss = key === "urlNoPattern";
 			for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
 				// `format` is carried AS its precomputed `pattern` (z.email() etc. keep the
 				// regex, lose the cosmetic keyword). Where the pattern matches, the
@@ -299,7 +308,9 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 				)
 					continue;
 				if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) {
-					lost.push(`${spec.name}.${key}: ${k} ${JSON.stringify(a[k])} -> ${JSON.stringify(b[k])}`);
+					(expectedLoss ? expected : lost).push(
+						`${spec.name}.${key}: ${k} ${JSON.stringify(a[k])} -> ${JSON.stringify(b[k])}`,
+					);
 				}
 			}
 			if (JSON.stringify(before.required ?? []) !== JSON.stringify(after.required ?? [])) {
@@ -315,6 +326,13 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		`constraint fidelity: swept ${checked} members, expected >= 47 — did the spec list shrink?`,
 	);
 	assert(lost.length === 0, `constraint fidelity: translation lost ${lost.length} — ${lost.join("; ")}`);
+	// The patternless format MUST show up as a difference. If it does not, the `format` skip
+	// has been loosened back to excusing a format nothing carried — the regression this
+	// member exists to catch.
+	assert(
+		expected.some((e) => e.includes("urlNoPattern")),
+		"constraint fidelity: a format with no pattern is SEEN as a loss, not skipped",
+	);
 	console.log(`6) translation preserves every constraint OK ✅ (${checked} members)`);
 }
 
@@ -475,6 +493,55 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		degradedOf({}) === "unreadable member — widened to unknown",
 		"reporting: an unreadable member degrades and says so",
 	);
+	// The real host REJECTS an empty enum ("enum requires at least one value"), but zod
+	// happily builds one that matches nothing — so the widening guard is invisible against
+	// zod-as-host. This host mirrors the real one, making the guard observable.
+	const strictEnum = new Proxy(zodV4.z, {
+		get: (t, p) =>
+			p === "enum"
+				? (v: string[]) => {
+						if (v.length === 0) throw new Error("enum requires at least one value");
+						return t.enum(v as [string, ...string[]]);
+					}
+				: t[p as keyof typeof t],
+	});
+	const numericEnum = hostMember(strictEnum as never, zodV4.z.enum({ A: 1, B: 2 } as never));
+	assert(
+		numericEnum.degraded?.includes("widened to string") === true &&
+			numericEnum.degraded?.includes("translation threw") !== true,
+		`reporting: an all-numeric enum is widened BEFORE the host sees it (got ${JSON.stringify(numericEnum.degraded)})`,
+	);
+
+	// Hosts whose `.optional()` / `.describe()` throw. These are the two tail guards, and
+	// the hostile-Proxy host below cannot reach them: its failures happen inside the switch,
+	// so the tail operates on a real zod `unknown` whose wrappers never throw.
+	const wrapperThrower = (bad: string) =>
+		new Proxy(zodV4.z, {
+			get: (t, p) =>
+				p === "string"
+					? () => {
+							const node = t.string();
+							return new Proxy(node, {
+								get: (n, q) =>
+									q === bad
+										? () => {
+												throw new Error(`host rejected .${bad}()`);
+											}
+										: n[q as keyof typeof n],
+							});
+						}
+					: t[p as keyof typeof t],
+		});
+	assert(
+		hostMember(wrapperThrower("optional") as never, zodV4.z.string().optional() as never)
+			.degraded?.includes("param is now required") === true,
+		"reporting: a throwing .optional() reports the lost optionality",
+	);
+	assert(
+		hostMember(wrapperThrower("describe") as never, zodV4.z.string().describe("D") as never)
+			.degraded?.includes("description dropped") === true,
+		"reporting: a throwing .describe() reports the lost description",
+	);
 	assert(degradedOf(zodV4.z.array(zodV4.z.string()).min(1)) === undefined, "reporting: no false positive on cardinality");
 
 	// A host where every builder EXCEPT `object`/`unknown` throws — the worst case a real
@@ -539,8 +606,48 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 							},
 			},
 		);
-		const pi2 = { ...pi, zod: { z: z2 }, registerTool: () => {} };
+		// Observe the guard, do not merely survive it: a catch that swallows its own reason
+		// leaves a 0-of-17 boot with no line saying so, and "it did not throw" cannot tell
+		// that apart from a healthy load.
+		const warns2: string[] = [];
+		const pi2 = {
+			...pi,
+			zod: { z: z2 },
+			registerTool: () => {},
+			logger: { info: () => {}, warn: (m: string) => warns2.push(m), error: (m: string) => warns2.push(m) },
+		};
 		cotalMesh(pi2 as never);
+		assert(
+			warns2.some((w) => w.includes("registration failed")),
+			`never-throw: a host rejecting .${broken}() REPORTS the failed specs`,
+		);
+		if (broken === "object") {
+			// Nothing can register at all — the mesh-deaf boot. It must be legible as such.
+			assert(
+				warns2.some((w) => w.includes("registered 0 of")),
+				"never-throw: registering zero tools is summarised, not left to N separate warnings",
+			);
+		}
+	}
+
+	// A logger that throws must not cost a tool. The guards REPORT through `log`, so an
+	// unguarded logger turns a contained degradation into an escaped factory throw — losing
+	// everything, at rc=0, precisely when something already went wrong.
+	for (const badLogger of [
+		{ info: () => {}, warn: () => { throw new Error("log write failed"); }, error: () => {} },
+		{ info: () => {}, error: () => {} },
+	]) {
+		const tools3 = new Map<string, RegisteredTool>();
+		const pi3 = {
+			...pi,
+			logger: badLogger,
+			registerTool: (t: RegisteredTool) => tools3.set(t.name, t),
+		};
+		cotalMesh(pi3 as never);
+		assert(
+			tools3.size === 17,
+			`never-throw: a broken logger costs no tools (got ${tools3.size} of 17)`,
+		);
 	}
 	console.log(`9) degradations reported; a throwing host degrades, not crashes OK ✅ (${tools.size} tools)`);
 }
