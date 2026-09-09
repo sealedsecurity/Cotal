@@ -142,10 +142,23 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 // the property the real 18.x host enforces.
 {
 	process.env.COTAL_NAME = "smoke-peer";
+	// Pin the capability surface instead of inheriting the ambient one: with COTAL_CREDS
+	// set, cotal_persona is filtered out and the regex path is never exercised, so this
+	// case would pass locally and fail in a clean CI env.
+	const prevCreds = process.env.COTAL_CREDS;
+	const prevCaps5 = process.env.COTAL_CAPABILITIES;
+	delete process.env.COTAL_CREDS;
+	process.env.COTAL_CAPABILITIES = "spawn";
 	const BUILT = Symbol("host-built");
 	const built = <T extends object>(o: T): T => Object.assign(o, { [BUILT]: true });
+	// Every builder hostMember can call must exist here, or the stub throws for a reason
+	// that has nothing to do with what the case is testing. This bit once: `.regex`/`.min`
+	// were missing, and the case only passed because ambient COTAL_CREDS hid the one
+	// spec member that uses a regex.
 	const leaf = () => built({
 		max: () => leaf(),
+		min: () => leaf(),
+		regex: () => leaf(),
 		optional: () => leaf(),
 		describe: () => leaf(),
 	});
@@ -180,6 +193,11 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	assert(tools.size > 0, "IR-style host: specs still register");
 	assert(tools.has("cotal_send"), "IR-style host: a spec with params registered");
 	assert(tools.has("cotal_feedback"), "IR-style host: a spec with enum + max params registered");
+	if (prevCreds === undefined) delete process.env.COTAL_CREDS;
+	else process.env.COTAL_CREDS = prevCreds;
+	if (prevCaps5 === undefined) delete process.env.COTAL_CAPABILITIES;
+	else process.env.COTAL_CAPABILITIES = prevCaps5;
+	assert(tools.has("cotal_persona"), "IR-style host: the regex-bearing spec was in scope");
 	console.log(`5) schema members rebuilt with host zod OK ✅ (${tools.size} tools)`);
 }
 
@@ -231,7 +249,13 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 			}
 		}
 	}
-	assert(checked > 0, "constraint fidelity: found spec members to check");
+	// A floor, not `> 0`: the failure this case exists to catch is the sweep silently
+	// SHRINKING (it was 29 before the capability gate was pinned, hiding the broken member).
+	// A floor stays green when specs gain params and goes red when coverage narrows.
+	assert(
+		checked >= 38,
+		`constraint fidelity: swept ${checked} members, expected >= 38 — did the spec list shrink?`,
+	);
 	assert(lost.length === 0, `constraint fidelity: translation lost ${lost.length} — ${lost.join("; ")}`);
 	console.log(`6) translation preserves every constraint OK ✅ (${checked} members)`);
 }
@@ -264,6 +288,22 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	assert(
 		hostMember(zodV4.z as never, unhandledOptional).degradedFrom === "number",
 		"fallback: reports the kind it could not translate",
+	);
+	// A kind the switch can NEVER learn, so this cannot decay: `number` is the likeliest
+	// future addition, and the day someone adds `case "number":` the assertions above stop
+	// testing the fallback while still passing. A synthetic kind keeps the contract pinned.
+	const synthetic = {
+		_zod: { def: { type: "optional", innerType: { _zod: { def: { type: "__never-handled__" } } } } },
+		description: "a kind the switch cannot handle",
+	};
+	const syn = hostMember(zodV4.z as never, synthetic);
+	assert(
+		syn.degradedFrom === "__never-handled__",
+		"fallback: names an arbitrary unhandled kind",
+	);
+	assert(
+		zodV4.z.object({ s: syn.schema as never }).safeParse({}).success,
+		"fallback: an arbitrary unhandled OPTIONAL kind stays optional",
 	);
 	// A handled kind must NOT report — a spurious warning trains readers to ignore the real one.
 	assert(

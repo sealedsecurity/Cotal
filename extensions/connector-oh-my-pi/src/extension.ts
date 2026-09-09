@@ -227,8 +227,11 @@ interface HostMemberResult {
  *
  *  An unrecognized member degrades to `z.unknown()` rather than throwing: a tool with a loose
  *  param still registers and works, where a throw would take the whole mesh connector down —
- *  which is the exact failure this function exists to prevent. The degradation always
- *  LOOSENS: an optional member stays optional, because a bare `z.unknown()` is required. */
+ *  which is the exact failure this function exists to prevent. An `optional`-wrapped member
+ *  stays optional, so that degradation loosens rather than narrows. Other wrappers
+ *  (`default`, `nullable`) are NOT preserved — they degrade to a required `unknown`, which
+ *  narrows; they are reported via `degradedFrom` rather than silently accepted, and no
+ *  current spec uses them. */
 export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMemberResult {
 	const node = member as ZodInternals;
 	const def = node?._zod?.def;
@@ -246,14 +249,22 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 		case "string": {
 			let s = z.string();
 			// Carry every constraint the specs use. A dropped one silently loosens the tool
-			// contract the model is shown, which is worse than a load failure: it never surfaces.
+			// contract the model is shown, which is worse than a load failure: it never
+			// surfaces. Anything we cannot carry is named in `degradedFrom` rather than
+			// vanishing — the kind still translates, so only the check is lost.
 			for (const check of coreDef.checks ?? []) {
 				const c = check._zod?.def;
 				if (c === undefined) continue;
 				if (c.check === "max_length" && c.maximum !== undefined) s = s.max(c.maximum);
 				else if (c.check === "min_length" && c.minimum !== undefined) s = s.min(c.minimum);
-				else if (c.check === "string_format" && c.format === "regex" && c.pattern !== undefined) {
+				else if (c.check === "string_format" && c.pattern !== undefined) {
+					// zod precomputes a pattern for every string format it can express as one
+					// (regex, starts_with, ends_with, includes, email, …), so this single
+					// branch carries all of them rather than just `.regex()`.
 					s = s.regex(c.pattern);
+				} else if (c.check !== undefined && c.check !== "overwrite") {
+					// `overwrite` (.trim()/.toLowerCase()) has no schema representation at all.
+					degradedFrom = `string check "${c.check}"`;
 				}
 			}
 			built = s;
@@ -280,15 +291,22 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 			break;
 		}
 		default:
-			// Fall THROUGH to the optional re-wrap below — never return early. A bare
-			// `z.unknown()` member is REQUIRED in zod, so returning here would flip an
-			// unhandled optional param to mandatory: a NARROWING, the opposite of the
-			// graceful loosening this fallback exists to provide.
+			// Widen to `unknown` and name the kind we could not reproduce. Never return
+			// early: a BARE `z.unknown()` is REQUIRED, so skipping the re-wrap below would
+			// flip an unhandled optional param to mandatory — a NARROWING, the opposite of
+			// the graceful loosening this fallback exists to provide.
 			built = z.unknown();
 			degradedFrom = coreDef?.type ?? "unreadable";
 			break;
 	}
 
-	if (description !== undefined) built = built.describe(description) as typeof built;
-	return { schema: inner !== undefined ? built.optional() : built, degradedFrom };
+	// Order matters, and ONLY on the IR host: `.optional()` there builds a new union node
+	// whose description is auto-derived and suppressed by the JSON-schema emitter, so
+	// describing FIRST silently drops the text for enum and unknown members. Applying
+	// `.optional()` first and describing last matches how the specs are authored and keeps
+	// the description on both hosts (on zod the two orders are identical).
+	const wrapped = inner !== undefined ? built.optional() : built;
+	if (description === undefined) return { schema: wrapped, degradedFrom };
+	const describable = wrapped as { describe(d: string): unknown };
+	return { schema: describable.describe(description), degradedFrom };
 }
