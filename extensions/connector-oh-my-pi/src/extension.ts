@@ -109,7 +109,7 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	// ---- cotal_* tools, rendered from the shared specs ----------------------
 	const { z } = pi.zod;
 	for (const spec of cotalToolSpecs(config, "oh-my-pi")) {
-		registerSpec(pi, agent, config, spec, z);
+		registerSpec(pi, agent, config, spec, z, log);
 	}
 
 	log(
@@ -126,6 +126,7 @@ function registerSpec(
 	config: ReturnType<typeof configFromEnv>,
 	spec: CotalToolSpec,
 	z: ExtensionAPI["zod"]["z"],
+	log: MeshLogger,
 ): void {
 	const toResult = (r: ToolResult) => ({
 		content: [{ type: "text" as const, text: r.isError ? `⚠ ${r.text}` : r.text }],
@@ -161,13 +162,15 @@ function registerSpec(
 	const shape: Record<string, unknown> = {};
 	for (const [key, member] of Object.entries(spec.schema ?? {})) {
 		// A degraded member is a silent contract change: this connector would serve a looser
-		// tool than every other one, with no signal. Name it in the log the connector
-		// already writes to, so a spec adding an unhandled kind is discoverable.
-		const kind = unwrapKind(member);
-		shape[key] = hostMember(z, member);
-		if (!TRANSLATED_KINDS.has(kind ?? "")) {
-			pi.logger.warn(
-				`[cotal-mesh] ${spec.name}.${key}: unhandled schema kind "${kind ?? "unreadable"}" — degraded to unknown`,
+		// tool than every other one, with no signal. `hostMember` reports the degradation
+		// itself rather than the caller re-deriving which kinds it handles — one source of
+		// truth, so the switch and the warning cannot drift apart.
+		const { schema, degradedFrom } = hostMember(z, member);
+		shape[key] = schema;
+		if (degradedFrom !== undefined) {
+			log(
+				`${spec.name}.${key}: unhandled schema kind "${degradedFrom}" — degraded to unknown`,
+				"warn",
 			);
 		}
 	}
@@ -208,16 +211,12 @@ interface ZodInternals {
 	description?: string;
 }
 
-/** The member kinds `hostMember` reproduces faithfully. Anything else degrades to
- *  `z.unknown()`, which is a contract change worth logging — see the caller. */
-const TRANSLATED_KINDS = new Set(["string", "boolean", "enum", "array"]);
-
-/** PURE: the kind of a member, looking through an `optional` wrapper. `undefined` when the
- *  member carries no readable zod internals at all. */
-function unwrapKind(member: unknown): string | undefined {
-	const def = (member as ZodInternals)?._zod?.def;
-	if (def === undefined) return undefined;
-	return def.type === "optional" ? def.innerType?._zod?.def?.type : def.type;
+/** What `hostMember` produced: the host-built schema, plus the kind it could NOT reproduce
+ *  when it had to fall back to `z.unknown()`. Reporting the degradation here rather than
+ *  letting the caller re-derive it keeps one source of truth for which kinds are handled. */
+interface HostMemberResult {
+	schema: unknown;
+	degradedFrom?: string;
 }
 
 /** PURE: rebuild one spec schema member with the HOST's zod.
@@ -228,11 +227,12 @@ function unwrapKind(member: unknown): string | undefined {
  *
  *  An unrecognized member degrades to `z.unknown()` rather than throwing: a tool with a loose
  *  param still registers and works, where a throw would take the whole mesh connector down —
- *  which is the exact failure this function exists to prevent. */
-export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknown {
+ *  which is the exact failure this function exists to prevent. The degradation always
+ *  LOOSENS: an optional member stays optional, because a bare `z.unknown()` is required. */
+export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMemberResult {
 	const node = member as ZodInternals;
 	const def = node?._zod?.def;
-	if (def === undefined) return z.unknown();
+	if (def === undefined) return { schema: z.unknown(), degradedFrom: "unreadable" };
 
 	// `.describe()` after `.optional()` lands on the OUTER node; before it, on the inner one.
 	const inner = def.type === "optional" ? def.innerType : undefined;
@@ -240,6 +240,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknow
 	const coreDef = core._zod?.def;
 	const description = node.description ?? core.description;
 
+	let degradedFrom: string | undefined;
 	let built: { describe(d: string): unknown; optional(): unknown };
 	switch (coreDef?.type) {
 		case "string": {
@@ -271,18 +272,23 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): unknow
 			built = values.length > 0 ? z.enum(values as [string, ...string[]]) : z.string();
 			break;
 		}
-		case "array":
-			built = z.array(hostMember(z, coreDef.element) as Parameters<typeof z.array>[0]);
+		case "array": {
+			const element = hostMember(z, coreDef.element);
+			// An untranslatable element degrades the array too — report the inner kind.
+			degradedFrom = element.degradedFrom;
+			built = z.array(element.schema as Parameters<typeof z.array>[0]);
 			break;
+		}
 		default:
 			// Fall THROUGH to the optional re-wrap below — never return early. A bare
 			// `z.unknown()` member is REQUIRED in zod, so returning here would flip an
 			// unhandled optional param to mandatory: a NARROWING, the opposite of the
 			// graceful loosening this fallback exists to provide.
 			built = z.unknown();
+			degradedFrom = coreDef?.type ?? "unreadable";
 			break;
 	}
 
 	if (description !== undefined) built = built.describe(description) as typeof built;
-	return inner !== undefined ? built.optional() : built;
+	return { schema: inner !== undefined ? built.optional() : built, degradedFrom };
 }

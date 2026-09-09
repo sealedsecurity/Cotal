@@ -217,7 +217,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 				required?: string[];
 			};
 			const after = zodV4.z.toJSONSchema(
-				zodV4.z.object({ [key]: hostMember(zodV4.z, member) as never }),
+				zodV4.z.object({ [key]: hostMember(zodV4.z, member).schema as never }),
 			) as { properties: Record<string, Record<string, unknown>>; required?: string[] };
 			const a = before.properties[key] ?? {};
 			const b = after.properties[key] ?? {};
@@ -245,7 +245,7 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 // opposite of the intent, and visible only on the omp connector.
 {
 	const unhandledOptional = zodV4.z.number().optional().describe("a future optional param");
-	const rebuilt = hostMember(zodV4.z as never, unhandledOptional) as never;
+	const rebuilt = hostMember(zodV4.z as never, unhandledOptional).schema as never;
 	const schema = zodV4.z.object({ limit: rebuilt });
 	assert(
 		schema.safeParse({}).success,
@@ -257,8 +257,19 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	);
 	// A REQUIRED unhandled member must stay required — widening applies to the type, not arity.
 	const unhandledRequired = zodV4.z.number().describe("a future required param");
-	const req = zodV4.z.object({ n: hostMember(zodV4.z as never, unhandledRequired) as never });
+	const req = zodV4.z.object({ n: hostMember(zodV4.z as never, unhandledRequired).schema as never });
 	assert(!req.safeParse({}).success, "fallback: an unhandled REQUIRED member stays required");
+	// The degradation must be REPORTED, not just survivable: silently serving a looser tool
+	// than every other connector is the failure this reporting exists to prevent.
+	assert(
+		hostMember(zodV4.z as never, unhandledOptional).degradedFrom === "number",
+		"fallback: reports the kind it could not translate",
+	);
+	// A handled kind must NOT report — a spurious warning trains readers to ignore the real one.
+	assert(
+		hostMember(zodV4.z as never, zodV4.z.string().optional()).degradedFrom === undefined,
+		"fallback: a translated kind reports no degradation",
+	);
 	console.log("7) unknown-kind fallback loosens without narrowing OK ✅");
 }
 
