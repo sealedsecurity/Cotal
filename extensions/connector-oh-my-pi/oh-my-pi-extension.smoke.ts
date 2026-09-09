@@ -213,6 +213,15 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	assert(tools.has("cotal_send"), "IR-style host: a spec with params registered");
 	assert(tools.has("cotal_feedback"), "IR-style host: a spec with enum + max params registered");
 	assert(tools.has("cotal_persona"), "IR-style host: the regex-bearing spec was in scope");
+	// Observe the SHAPE, not just that a tool appeared. Nothing else in the suite looks at a
+	// registered tool's `parameters`, so discarding every param (`z.object({})`) would leave
+	// all cases green while every cotal_* tool advertised zero arguments.
+	const sendShape = (tools.get("cotal_send")?.parameters as { shape?: Record<string, unknown> })
+		?.shape;
+	assert(
+		sendShape !== undefined && Object.keys(sendShape).length === 3,
+		`IR-style host: cotal_send carries its 3 params (got ${JSON.stringify(Object.keys(sendShape ?? {}))})`,
+	);
 	console.log(`5) schema members rebuilt with host zod OK ✅ (${tools.size} tools)`);
 }
 
@@ -280,7 +289,15 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 				// regex, lose the cosmetic keyword). Where the pattern matches, the
 				// constraint survived, so demanding the keyword too would fail a faithful
 				// translation — and a red gate gets the CODE "fixed", not the test.
-				if (k === "format" && JSON.stringify(a.pattern) === JSON.stringify(b.pattern)) continue;
+				// ...but only when a pattern really carried it. With no pattern on EITHER side
+				// (url, jwt) the constraint did not survive, it vanished — so the skip must
+				// not excuse that too.
+				if (
+					k === "format" &&
+					b.pattern !== undefined &&
+					JSON.stringify(a.pattern) === JSON.stringify(b.pattern)
+				)
+					continue;
 				if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) {
 					lost.push(`${spec.name}.${key}: ${k} ${JSON.stringify(a[k])} -> ${JSON.stringify(b[k])}`);
 				}
@@ -406,6 +423,14 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		result.desc === "ATTN-DESC",
 		`IR host: description survives the optional wrapper (got ${JSON.stringify(result.desc)}) — describe must be applied AFTER optional`,
 	);
+	// The OTHER authoring order: describing before .optional() puts the text on the inner
+	// node only, so the outer lookup misses it and the `?? core.description` fallback is the
+	// only thing carrying it. No current spec writes this order, so nothing else covers it.
+	const describedFirst = zodV4.z.string().describe("INNER-DESC").optional();
+	assert(
+		(hostMember(irZ as never, describedFirst).schema as IRNode).desc === "INNER-DESC",
+		"IR host: a description authored BEFORE .optional() is still carried",
+	);
 	// A required member keeps its description too (no wrapper involved).
 	const required = zodV4.z.string().describe("REQ-DESC");
 	assert(
@@ -438,6 +463,18 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		"reporting: an element loss says it was the element, not the array",
 	);
 	assert(degradedOf(zodV4.z.string().max(3)) === undefined, "reporting: no false positive");
+	assert(
+		degradedOf(zodV4.z.string().trim().max(4)) === undefined,
+		"reporting: .trim() is a transform, not a dropped constraint — no false positive",
+	);
+	assert(
+		degradedOf(zodV4.z.url())?.includes("has no pattern") === true,
+		"reporting: a format with no pattern reports the dropped constraint",
+	);
+	assert(
+		degradedOf({}) === "unreadable member — widened to unknown",
+		"reporting: an unreadable member degrades and says so",
+	);
 	assert(degradedOf(zodV4.z.array(zodV4.z.string()).min(1)) === undefined, "reporting: no false positive on cardinality");
 
 	// A host where every builder EXCEPT `object`/`unknown` throws — the worst case a real
@@ -457,10 +494,12 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		},
 	);
 	const tools = new Map<string, RegisteredTool>();
+	const warns: string[] = [];
 	const pi = {
-		// `object`/`unknown` must work, or there is no tool to register at all.
+		// `object`/`unknown` are real here so there IS a tool to inspect; the hosts that
+		// reject even those are exercised separately below.
 		zod: { z: hostileZ },
-		logger: console,
+		logger: { info: () => {}, warn: (m: string) => warns.push(m), error: () => {} },
 		registerTool: (t: RegisteredTool) => tools.set(t.name, t),
 		on: () => {},
 		sendMessage: () => {},
@@ -471,6 +510,38 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	cotalMesh(pi as never);
 	assert(tools.size > 0, "never-throw: a hostile host still registers tools, it does not kill the extension");
 	assert(tools.has("cotal_send"), "never-throw: a spec whose every member throws still registers");
+	assert(
+		warns.some((w) => w.includes("translation threw")),
+		"never-throw: the degradation is WARNED, not silent",
+	);
+	// A degraded tool must stay CALLABLE as authored. A bare `unknown` is required in zod,
+	// so degrading without re-wrapping turns an all-optional tool into one the model cannot
+	// call at all — worse than the tool being absent, because it will keep trying.
+	const status = tools.get("cotal_status")?.parameters as
+		| { safeParse(v: unknown): { success: boolean } }
+		| undefined;
+	assert(
+		status?.safeParse({}).success === true,
+		"never-throw: an all-optional tool is still callable with {} after degradation",
+	);
+
+	// Hosts that reject even `unknown` or `object`: the factory must not throw. Registering
+	// nothing is an acceptable outcome; taking the extension down is not.
+	for (const broken of ["unknown", "object"]) {
+		const z2 = new Proxy(
+			{ object: zodV4.z.object, unknown: zodV4.z.unknown },
+			{
+				get: (target, prop) =>
+					prop !== broken && prop in target
+						? target[prop as keyof typeof target]
+						: () => {
+								throw new Error(`host rejected .${String(prop)}()`);
+							},
+			},
+		);
+		const pi2 = { ...pi, zod: { z: z2 }, registerTool: () => {} };
+		cotalMesh(pi2 as never);
+	}
 	console.log(`9) degradations reported; a throwing host degrades, not crashes OK ✅ (${tools.size} tools)`);
 }
 

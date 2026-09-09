@@ -109,7 +109,17 @@ export default function cotalMesh(pi: ExtensionAPI): void {
 	// ---- cotal_* tools, rendered from the shared specs ----------------------
 	const { z } = pi.zod;
 	for (const spec of cotalToolSpecs(config, "oh-my-pi")) {
-		registerSpec(pi, agent, config, spec, z, log);
+		// One bad spec costs one tool, not all of them. `hostMember` guards the members, but
+		// the host's `object()` and `registerTool()` can reject a whole spec — the real 18.x
+		// `object()` throws on a member it dislikes, which is this connector's original bug.
+		// Unguarded, that removes EVERY cotal_* tool, and the process still exits 0, so the
+		// agent boots mesh-deaf and looks healthy.
+		try {
+			registerSpec(pi, agent, config, spec, z, log);
+		} catch (e) {
+			const reason = e instanceof Error ? e.message : String(e);
+			log(`${spec.name}: registration failed (${reason}) — tool not registered`, "warn");
+		}
 	}
 
 	log(
@@ -165,23 +175,11 @@ function registerSpec(
 		// tool than every other one, with no signal. `hostMember` reports the degradation
 		// itself rather than the caller re-deriving which kinds it handles — one source of
 		// truth, so the switch and the warning cannot drift apart.
-		//
-		// The catch makes the never-throw contract real rather than merely documented. It
-		// cannot be enforced by types: `z` is typed as zod, but an 18.x host is a different
-		// object that only resembles it, so a missing or stricter builder method surfaces at
-		// RUNTIME. Unguarded, one throw here escapes the extension factory and removes EVERY
-		// cotal_* tool — the silent total outage this whole function exists to prevent, and
-		// the process still exits 0. One loose param plus a warning is the better trade.
-		let result: HostMemberResult;
-		try {
-			result = hostMember(z, member);
-		} catch (e) {
-			const reason = e instanceof Error ? e.message : String(e);
-			result = { schema: z.unknown(), degraded: `translation threw (${reason}) — widened to unknown` };
-		}
-		shape[key] = result.schema;
-		if (result.degraded !== undefined) {
-			log(`${spec.name}.${key}: ${result.degraded}`, "warn");
+		// `hostMember` owns the never-throw contract and reports its own degradations.
+		const { schema, degraded } = hostMember(z, member);
+		shape[key] = schema;
+		if (degraded !== undefined) {
+			log(`${spec.name}.${key}: ${degraded}`, "warn");
 		}
 	}
 	const parameters = z.object(shape as Parameters<typeof z.object>[0]);
@@ -276,6 +274,14 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 
 	const losses: string[] = [];
 	let built: Chainable;
+	// The never-throw contract is enforced HERE, where it is documented, so there is exactly
+	// one degradation path and it always reaches the `.optional()` re-wrap below. Enforcing
+	// it in the caller instead produced a second path that could not reach the re-wrap, so a
+	// caught throw returned a BARE `unknown` and flipped optional params to REQUIRED — the
+	// narrowing the default arm goes out of its way to avoid. A builder can throw for real:
+	// `z` is typed as zod, but an 18.x host merely resembles it, so a missing or stricter
+	// method surfaces at runtime and tsc cannot see it.
+	try {
 	switch (coreDef?.type) {
 		case "string": {
 			let s = z.string();
@@ -379,14 +385,32 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 			losses.push(`unhandled schema kind "${coreDef?.type ?? "unreadable"}" — widened to unknown`);
 			break;
 	}
+	} catch (e) {
+		built = z.unknown();
+		losses.push(`translation threw (${e instanceof Error ? e.message : String(e)}) — widened to unknown`);
+	}
 
 	// Order matters, and ONLY on the IR host: `.optional()` there builds a new union node
 	// whose description is auto-derived and suppressed by the JSON-schema emitter, so
 	// describing FIRST silently drops the text for enum and unknown members. Applying
 	// `.optional()` first and describing last matches how the specs are authored and keeps
 	// the description on both hosts (on zod the two orders are identical).
-	const wrapped: Chainable = inner !== undefined ? built.optional() : built;
-	const degraded = losses.length > 0 ? losses.join("; ") : undefined;
-	if (description === undefined) return { schema: wrapped, degraded };
-	return { schema: wrapped.describe(description), degraded };
+	// The wrapper calls can throw on a hostile host too. Losing optionality or a description
+	// is a degradation; losing the whole member is not, so each is applied defensively.
+	let wrapped: Chainable = built;
+	if (inner !== undefined) {
+		try {
+			wrapped = built.optional();
+		} catch (e) {
+			losses.push(`optional wrapper threw (${e instanceof Error ? e.message : String(e)}) — param is now required`);
+		}
+	}
+	if (description !== undefined) {
+		try {
+			wrapped = wrapped.describe(description);
+		} catch (e) {
+			losses.push(`describe threw (${e instanceof Error ? e.message : String(e)}) — description dropped`);
+		}
+	}
+	return { schema: wrapped, degraded: losses.length > 0 ? losses.join("; ") : undefined };
 }
