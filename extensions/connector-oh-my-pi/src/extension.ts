@@ -188,7 +188,8 @@ function registerSpec(
  *  `array`, each optionally wrapped in `optional`. `_zod.def` is the v4 introspection surface. */
 interface ZodCheckDef {
 	check?: string;
-	format?: string;
+	/** Present on a `string_format` check; dispatch is on `pattern`, since zod precomputes
+	 *  one for every format it can express as a regex. */
 	pattern?: RegExp;
 	maximum?: number;
 	minimum?: number;
@@ -207,6 +208,13 @@ interface ZodDef {
 	entries?: Record<string, unknown>;
 	checks?: { _zod?: { def?: ZodCheckDef } }[];
 }
+/** The builder surface `hostMember` chains on. Self-referential so `.optional()` keeps its
+ *  type instead of erasing to `unknown` and forcing a cast straight back. */
+interface Chainable {
+	describe(d: string): Chainable;
+	optional(): Chainable;
+}
+
 interface ZodInternals {
 	_zod?: { def?: ZodDef };
 	description?: string;
@@ -248,8 +256,8 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 	const coreDef = core._zod?.def;
 	const description = node.description ?? core.description;
 
-	let degraded: string | undefined;
-	let built: { describe(d: string): unknown; optional(): unknown };
+	const losses: string[] = [];
+	let built: Chainable;
 	switch (coreDef?.type) {
 		case "string": {
 			let s = z.string();
@@ -259,7 +267,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 			// constraint disappears with the loop never seeing it.
 			if (coreDef.format !== undefined) {
 				if (coreDef.pattern !== undefined) s = s.regex(coreDef.pattern);
-				else degraded = `string format "${coreDef.format}" has no pattern — constraint dropped`;
+				else losses.push(`string format "${coreDef.format}" has no pattern — constraint dropped`);
 			}
 			// Carry every constraint the specs use. A dropped one silently loosens the tool
 			// contract the model is shown, which is worse than a load failure: it never
@@ -276,7 +284,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 					s = s.regex(c.pattern);
 				} else if (c.check !== undefined && c.check !== "overwrite") {
 					// `overwrite` (.trim()/.toLowerCase()) has no schema representation at all.
-					degraded = `string check "${c.check}" not reproducible — constraint dropped`;
+					losses.push(`string check "${c.check}" not reproducible — constraint dropped`);
 				}
 			}
 			built = s;
@@ -298,8 +306,19 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 		case "array": {
 			const element = hostMember(z, coreDef.element);
 			// An untranslatable element degrades the array too — report the inner kind.
-			degraded = element.degraded;
-			built = z.array(element.schema as Parameters<typeof z.array>[0]);
+			if (element.degraded !== undefined) losses.push(element.degraded);
+			let a = z.array(element.schema as Parameters<typeof z.array>[0]);
+			// Cardinality lives in the array's own checks, same shape as a string's length.
+			for (const check of coreDef.checks ?? []) {
+				const c = check._zod?.def;
+				if (c === undefined) continue;
+				if (c.check === "max_length" && c.maximum !== undefined) a = a.max(c.maximum);
+				else if (c.check === "min_length" && c.minimum !== undefined) a = a.min(c.minimum);
+				else if (c.check !== undefined) {
+					losses.push(`array check "${c.check}" not reproducible — constraint dropped`);
+				}
+			}
+			built = a;
 			break;
 		}
 		default:
@@ -308,7 +327,7 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 			// flip an unhandled optional param to mandatory — a NARROWING, the opposite of
 			// the graceful loosening this fallback exists to provide.
 			built = z.unknown();
-			degraded = `unhandled schema kind "${coreDef?.type ?? "unreadable"}" — widened to unknown`;
+			losses.push(`unhandled schema kind "${coreDef?.type ?? "unreadable"}" — widened to unknown`);
 			break;
 	}
 
@@ -317,8 +336,8 @@ export function hostMember(z: ExtensionAPI["zod"]["z"], member: unknown): HostMe
 	// describing FIRST silently drops the text for enum and unknown members. Applying
 	// `.optional()` first and describing last matches how the specs are authored and keeps
 	// the description on both hosts (on zod the two orders are identical).
-	const wrapped = inner !== undefined ? built.optional() : built;
+	const wrapped: Chainable = inner !== undefined ? built.optional() : built;
+	const degraded = losses.length > 0 ? losses.join("; ") : undefined;
 	if (description === undefined) return { schema: wrapped, degraded };
-	const describable = wrapped as { describe(d: string): unknown };
-	return { schema: describable.describe(description), degraded };
+	return { schema: wrapped.describe(description), degraded };
 }

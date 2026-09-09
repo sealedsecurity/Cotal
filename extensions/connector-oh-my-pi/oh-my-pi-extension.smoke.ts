@@ -190,13 +190,15 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 	};
 	// Before the fix this threw while registering the first spec with params.
 	cotalMesh(pi as never);
-	assert(tools.size > 0, "IR-style host: specs still register");
-	assert(tools.has("cotal_send"), "IR-style host: a spec with params registered");
-	assert(tools.has("cotal_feedback"), "IR-style host: a spec with enum + max params registered");
+	// Restore BEFORE asserting: `assert` exits the process, so a restore placed after a
+	// failing assert never runs. Nothing below reads the env.
 	if (prevCreds === undefined) delete process.env.COTAL_CREDS;
 	else process.env.COTAL_CREDS = prevCreds;
 	if (prevCaps5 === undefined) delete process.env.COTAL_CAPABILITIES;
 	else process.env.COTAL_CAPABILITIES = prevCaps5;
+	assert(tools.size > 0, "IR-style host: specs still register");
+	assert(tools.has("cotal_send"), "IR-style host: a spec with params registered");
+	assert(tools.has("cotal_feedback"), "IR-style host: a spec with enum + max params registered");
 	assert(tools.has("cotal_persona"), "IR-style host: the regex-bearing spec was in scope");
 	console.log(`5) schema members rebuilt with host zod OK ✅ (${tools.size} tools)`);
 }
@@ -311,6 +313,67 @@ process.env.COTAL_SERVERS = "nats://127.0.0.1:4222"; // never actually connected
 		"fallback: a translated kind reports no degradation",
 	);
 	console.log("7) unknown-kind fallback loosens without narrowing OK ✅");
+}
+
+// ---- 8. describe survives the optional wrapper on an IR-style host --------------
+// The bug this defends is invisible to every case above, which is exactly why it shipped:
+// case 5's stub discards its arguments, and case 6 uses real zod as the host, where
+// `.describe().optional()` and `.optional().describe()` are equivalent. On the omp 18.x IR
+// facade they are NOT — `.optional()` builds a NEW union node that does not inherit the
+// inner description, and the emitter suppresses the auto-derived one, so describing FIRST
+// drops the text from the schema the model is shown.
+//
+// This host reproduces that one property: `.optional()` returns a node WITHOUT the desc.
+{
+	interface IRNode {
+		desc?: string;
+		describe(d: string): IRNode;
+		optional(): IRNode;
+		max(n: number): IRNode;
+		min(n: number): IRNode;
+		regex(r: RegExp): IRNode;
+	}
+	const node = (desc?: string): IRNode => ({
+		desc,
+		describe(d) {
+			return node(d);
+		},
+		// The IR union does not carry the inner node's description — the whole bug.
+		optional() {
+			return node(undefined);
+		},
+		max() {
+			return node(desc);
+		},
+		min() {
+			return node(desc);
+		},
+		regex() {
+			return node(desc);
+		},
+	});
+	const irZ = {
+		string: () => node(),
+		boolean: () => node(),
+		enum: () => node(),
+		array: () => node(),
+		unknown: () => node(),
+		object: (shape: Record<string, unknown>) => ({ shape }),
+	};
+	// An optional member WITH a description — the shape of cotal_status.attention.
+	const member = zodV4.z.enum(["open", "dnd", "focus"]).optional().describe("ATTN-DESC");
+	const result = hostMember(irZ as never, member).schema as IRNode;
+	assert(
+		result.desc === "ATTN-DESC",
+		`IR host: description survives the optional wrapper (got ${JSON.stringify(result.desc)}) — describe must be applied AFTER optional`,
+	);
+	// A required member keeps its description too (no wrapper involved).
+	const required = zodV4.z.string().describe("REQ-DESC");
+	assert(
+		(hostMember(irZ as never, required).schema as IRNode).desc === "REQ-DESC",
+		"IR host: a required member keeps its description",
+	);
+	console.log("8) description survives .optional() on an IR-style host OK ✅");
 }
 
 console.log("\nCOTAL-MESH EXTENSION SMOKE OK ✅");
